@@ -56,29 +56,24 @@ extern "C" {
 #define BT_MESH_CHAT_CLI_OP_DSDV_DATA BT_MESH_MODEL_OP_3(0x14, \
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
 
+/** Opcode: LED toggle packet (remote LED control) */
+#define BT_MESH_CHAT_CLI_OP_LED_TOGGLE BT_MESH_MODEL_OP_3(0x15, \
+									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
+
 /* ============================================================================
  * MESSAGE LENGTH CONSTANTS
  * ============================================================================ */
 									   
 #define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_HELLO 8                /**< HELLO packet size */
+#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_UPDATE_MIN 8           /**< Minimum UPDATE packet size */
 // #define BT_MESH_CHAT_CLI_MSG_LEN_NETWORK_METRICS 15       /**< DEPRECATED: Legacy standalone metrics */
 #define BT_MESH_CHAT_CLI_MSG_LEN_METRICS_ACK 8               /**< Metrics ACK packet size */
 #define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_DATA_MAX 128           /**< Maximum DATA packet size */
+#define BT_MESH_CHAT_CLI_MSG_LEN_LED_TOGGLE 8                /**< LED toggle packet size */
 
 /* ============================================================================
  * DATA STRUCTURES - Packet formats and routing table entries
  * ============================================================================ */
-
-/**
- * @brief Per-neighbor RSSI tracking entry
- * 
- * Stores RSSI measurement for each neighbor to enable link quality
- * assessment and route selection.
- */
-struct neighbor_rssi_entry {
-	uint16_t addr;  /**< Neighbor node address */
-	int8_t rssi;    /**< RSSI value in dBm */
-} __packed;
 
 /** Maximum number of neighbors to include in metrics packet */
 #define MAX_NEIGHBORS_IN_METRICS 8
@@ -126,9 +121,7 @@ struct dsdv_route_entry {
 	uint8_t hop_count;           /**< Number of hops to destination (0xFF = invalidation) */
 	uint32_t seq_num;            /**< Sequence number from destination (freshness / odd=invalid) */
 	uint32_t last_update_time;   /**< Last successful update time (ms) */
-	uint8_t tentative;           /**< 1 = route learned without confirmed HELLO yet */
-	uint8_t fail_streak;         /**< Consecutive send failures via this route */
-	uint8_t dirty;               /**< 1 = needs to be advertised in next incremental UPDATE */
+	uint8_t changed;             
 	uint8_t _pad;                /**< Padding for alignment */
 }__packed;
 
@@ -141,6 +134,7 @@ struct dsdv_route_entry {
 struct dsdv_hello {
     uint16_t src;       /**< Source node address */
     uint32_t seq_num;   /**< Source's sequence number (even numbers only) */
+
 } __packed;
 
 /**
@@ -191,10 +185,17 @@ struct dsdv_data_packet {
 	uint8_t collect_relay_metrics;  // Flag: 1 = relays send metrics separately
 } __packed;
 
-// Network structure request packet (destination will print its routing table)
-struct structure_request_packet {
-	uint16_t requester_addr;
-	uint32_t request_seq;
+/**
+ * @brief LED toggle message structure
+ * 
+ * Remote LED control message sent through DSDV routing.
+ * Contains source address, destination address, and sequence number
+ * for duplicate detection and routing.
+ */
+struct led_toggle_message {
+	uint16_t src;        /**< Source node address */
+	uint16_t dest;       /**< Destination node address */
+	uint32_t seq_num;    /**< Sequence number for duplicate detection */
 } __packed;
 
 /* Forward declaration of the Bluetooth Mesh Chat Client model context. */
@@ -323,6 +324,22 @@ int bt_mesh_chat_cli_metrics_send(struct bt_mesh_chat_cli *chat, uint16_t addr);
  * @retval -ENOENT No route to destination.
  */
 int bt_mesh_chat_cli_structure_request(struct bt_mesh_chat_cli *chat, uint16_t dest);
+
+/**
+ * @brief Send LED toggle command to a remote node
+ *
+ * Sends an LED toggle message to the specified destination node through
+ * DSDV routing. The target node will blink its LED1 three times upon
+ * receiving the message.
+ *
+ * @param[in] chat Chat Client model instance.
+ * @param[in] dest Destination unicast address to send LED toggle command.
+ *
+ * @retval 0 on success.
+ * @retval -EINVAL Invalid arguments or destination address.
+ * @retval -ENOENT No route to destination.
+ */
+int bt_mesh_chat_cli_led_toggle_send(struct bt_mesh_chat_cli *chat, uint16_t dest);
 
 /** @cond INTERNAL_HIDDEN */
 extern const struct bt_mesh_model_op _bt_mesh_chat_cli_op[];

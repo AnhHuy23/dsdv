@@ -5,17 +5,16 @@
  */
 
 #include <stdio.h>
-
 #include <zephyr/bluetooth/bluetooth.h>
 #include <bluetooth/mesh/models.h>
 #include <dk_buttons_and_leds.h>
-
 #include <zephyr/shell/shell.h>
 #include <zephyr/shell/shell_uart.h>
 #include "chat_cli.h"
 #include "model_handler.h"
 #include <stdlib.h>
 #include <zephyr/logging/log.h>
+
 // Extern DSDV routing table from chat_cli.c
 extern struct dsdv_route_entry g_dsdv_routes[];
 #define DSDV_ROUTE_TABLE_SIZE 64
@@ -70,15 +69,6 @@ BT_MESH_HEALTH_PUB_DEFINE(health_pub, 0);
 /******************************************************************************/
 /***************************** Chat model setup *******************************/
 /******************************************************************************/
-struct metrics_cache_entry
-{
-	uint16_t src_addr;
-	uint16_t about_addr;
-	struct bt_mesh_network_metrics last_metrics;
-	uint32_t measurement_count;
-	uint32_t last_latency_us;  // Store calculated latency
-};
-static struct metrics_cache_entry metrics_cache[16];  // 4x4 nodes max
 
 static void print_client_status(void);
 
@@ -285,9 +275,66 @@ static int cmd_neighbor_rssi(const struct shell *shell, size_t argc, char **argv
     return 0;
 }
 
+/* === NEW: RELAY CONFIG COMMAND MOVED HERE === */
+static int cmd_relay_config(const struct shell *shell, size_t argc, char *argv[])
+{
+    if (argc < 2) {
+        shell_print(shell, "Usage: relay <on/off>");
+        return -EINVAL;
+    }
 
+    bool enable = false;
+    if (strcmp(argv[1], "on") == 0) enable = true;
+    else if (strcmp(argv[1], "off") == 0) enable = false;
+    else {
+        shell_error(shell, "Invalid argument. Use 'on' or 'off'");
+        return -EINVAL;
+    }
 
+#if defined(CONFIG_BT_MESH_CFG_SRV)
+    extern void bt_mesh_cfg_srv_relay_set(uint8_t new_relay, uint8_t new_transmit);
+    bt_mesh_cfg_srv_relay_set(enable ? BT_MESH_RELAY_ENABLED : BT_MESH_RELAY_DISABLED, 
+                              BT_MESH_TRANSMIT(2, 20)); 
+    shell_print(shell, "Relay configured: %s", enable ? "ENABLED (Backbone)" : "DISABLED (Leaf)");
+#else
+    shell_print(shell, "Error: CONFIG_BT_MESH_CFG_SRV not enabled in prj.conf");
+#endif
 
+    return 0;
+}
+
+static int cmd_led_toggle(const struct shell *shell, size_t argc, char *argv[])
+{
+    uint16_t target_addr;
+    int err;
+
+    if (argc < 2) {
+        shell_error(shell, "Usage: led_toggle <addr>");
+        return -EINVAL;
+    }
+
+    target_addr = strtol(argv[1], NULL, 0);
+
+    if (target_addr == 0 || target_addr > 0x7FFF) {
+        shell_error(shell, "Invalid target address: 0x%04X", target_addr);
+        return -EINVAL;
+    }
+
+    uint16_t my_addr = bt_mesh_model_elem(chat.model)->rt->addr;
+    if (target_addr == my_addr) {
+        shell_error(shell, "Cannot toggle LED on self (0x%04X)", my_addr);
+        return -EINVAL;
+    }
+
+    err = bt_mesh_chat_cli_led_toggle_send(&chat, target_addr);
+    if (err) {
+        shell_error(shell, "Failed to send LED toggle to 0x%04X: %d", target_addr, err);
+        return err;
+    }
+
+    shell_print(shell, "LED toggle sent to 0x%04X", target_addr);
+    return 0;
+}
 
 SHELL_STATIC_SUBCMD_SET_CREATE(chat_cmds,
 	SHELL_CMD_ARG(status, NULL, "Print client status", cmd_status, 1, 0),
@@ -298,6 +345,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(chat_cmds,
 		      cmd_verify_route, 2, 0),
 	SHELL_CMD_ARG(neighbors, NULL, "Show per-neighbor RSSI",
 		      cmd_neighbor_rssi, 1, 0),
+    SHELL_CMD_ARG(relay, NULL, "Set relay: relay <on/off>", 
+              cmd_relay_config, 2, 0), /* Register relay command here */
+	SHELL_CMD_ARG(led_toggle, NULL, "Toggle LED on remote node <addr>",
+		      cmd_led_toggle, 2, 0),
 	SHELL_SUBCMD_SET_END
 );
 
@@ -324,8 +375,7 @@ const struct bt_mesh_comp *model_handler_init(void)
 {
 	chat_shell = shell_backend_uart_get_ptr();
 	
-	// Initialize LED blink work queue
-	k_work_init_delayable(&led_blink_work, led_blink_work_handler);
+    	k_work_init_delayable(&led_blink_work, led_blink_work_handler);
 
 	return &comp;
 }
