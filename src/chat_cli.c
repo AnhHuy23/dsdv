@@ -26,11 +26,12 @@
 #define MAX_UPDATE_ENTRIES 12
 #define DSDV_DUP_CACHE_SIZE 100
 // Điều chỉnh timeout cho môi trường test ổn định
-#define DSDV_NEIGHBOR_TIMEOUT_MS  30000  // Tăng từ 20s lên 30s
-#define DSDV_ROUTE_TIMEOUT_MS     90000  // Tăng từ 60s lên 90s 
+#define DSDV_NEIGHBOR_TIMEOUT_MS  45000  // Tăng lên 45s - cho phép miss nhiều HELLO hơn
+#define DSDV_ROUTE_TIMEOUT_MS     120000 // Tăng lên 120s - multi-hop route cần thời gian hội tụ
 #define MAX_RSSI_NEIGHBORS 32 
-#define NEIGHBOR_RSSI_VALID_WINDOW_MS 60000  // Tăng từ 45s lên 60s
+#define NEIGHBOR_RSSI_VALID_WINDOW_MS 90000  // Tăng lên 90s - giữ RSSI data lâu hơn
 #define MAX_ROUTE_HISTORY 5
+#define ROUTE_SETTLE_TIME_MS 10000  // Route phải ổn định ít nhất 10s trước khi cho phép switch
 
 #define TTL_HELLO           1   
 #define TTL_UPDATE_CAP      3   
@@ -283,8 +284,10 @@ static void dsdv_send_hello(struct k_work *work){
 	}
 	uint16_t my_addr = bt_mesh_model_elem(g_chat_cli_instance->model)->rt->addr;
 
+    // Giảm tần suất tăng seq_num: mỗi ~80s thay vì ~30s
+    // Seq tăng chậm hơn = ít trigger full table update hơn
     static int keep_alive_cnt = 0;
-    if (++keep_alive_cnt > 6) { 
+    if (++keep_alive_cnt > 16) { 
          g_dsdv_my_seq += 2; 
          keep_alive_cnt = 0;
          dsdv_my_info_changed = true; 
@@ -313,8 +316,9 @@ static void dsdv_send_hello(struct k_work *work){
         k_work_reschedule(&dsdv_update_work, K_MSEC(500 + (sys_rand32_get() % 500)));
     }
     
-	uint32_t jitter = sys_rand32_get() % 4000;
-	k_work_reschedule(&dsdv_hello_work, K_MSEC(4000 + jitter));
+	// Tăng HELLO interval lên 6-12s để giảm traffic overhead
+	uint32_t jitter = sys_rand32_get() % 6000;
+	k_work_reschedule(&dsdv_hello_work, K_MSEC(6000 + jitter));
 }
 
 static int handle_dsdv_hello(const struct bt_mesh_model *model,
@@ -334,10 +338,10 @@ static int handle_dsdv_hello(const struct bt_mesh_model *model,
 	if (dest == my_addr) return 0;
 	
 	// Hysteresis RSSI filtering cho ổn định
-	// Nếu đã có route, dùng threshold thấp hơn để tránh flapping
-	// Giảm threshold để tránh reject routes hợp lệ trong môi trường yếu tín hiệu
+	// Tăng threshold lên để chỉ chấp nhận neighbor có tín hiệu đủ mạnh
+	// Gap 5 dBm giữa existing và new để tránh flapping
 	struct dsdv_route_entry *existing_route = find_route(dest);
-	int8_t rssi_threshold = existing_route ? -88 : -85;  // -88 cho existing, -85 cho new (gap 3 dBm, threshold thấp hơn)
+	int8_t rssi_threshold = existing_route ? -80 : -75;  // -80 cho existing, -75 cho new (gap 5 dBm)
 	
 	if (ctx->recv_rssi != 0 && ctx->recv_rssi < rssi_threshold) {
 		return 0;
@@ -472,8 +476,11 @@ static void dsdv_send_update(struct k_work *work)
         dsdv_route_changed = false;
     }
 
-    uint32_t base_delay = dsdv_route_changed ? 800 : 3000;
-    uint32_t jitter = sys_rand32_get() % 1000;
+    // Tăng delay giữa các UPDATE để giảm storm
+    // Khi có thay đổi: chờ 2-4s thay vì 0.8-1.8s
+    // Khi ổn định: chờ 5-8s thay vì 3-4s
+    uint32_t base_delay = dsdv_route_changed ? 2000 : 5000;
+    uint32_t jitter = sys_rand32_get() % 3000;
     k_work_reschedule(&dsdv_update_work, K_MSEC(base_delay + jitter));
 }
 
@@ -611,16 +618,32 @@ static void dsdv_upsert(uint16_t dest, uint16_t next_hop, uint8_t hop_count, uin
         }
         else if (seq_num == e->seq_num) {
             if (hop_count < e->hop_count) {
-                e->next_hop = next_hop;
-                e->hop_count = hop_count;
-                e->seq_num = seq_num;
+                // Chỉ switch nếu route hiện tại đã settle đủ lâu
+                // Hoặc nếu cải thiện >= 2 hops
+                uint32_t route_age = now - e->last_update_time;
+                if (route_age > ROUTE_SETTLE_TIME_MS || (e->hop_count - hop_count) >= 2) {
+                    e->next_hop = next_hop;
+                    e->hop_count = hop_count;
+                    e->seq_num = seq_num;
+                    e->last_update_time = now;
+                    e->changed = 1;
+                    dsdv_route_changed = true;
+                    local_changed = true;
+                } else {
+                    // Chưa settle, chỉ refresh timestamp
+                    e->last_update_time = now;
+                }
             }
             else if (hop_count == e->hop_count) {
                 int8_t new_rssi = get_neighbor_rssi(next_hop);
                 int8_t old_rssi = get_neighbor_rssi(e->next_hop);
                 
-                // Tăng threshold từ +5 dBm lên +8 dBm để chỉ switch khi có cải thiện đáng kể
-                if (new_rssi != -127 && old_rssi != -127 && new_rssi >= old_rssi + 8) {
+                // Tăng threshold lên +10 dBm VÀ kiểm tra settle time
+                // Chỉ switch khi RSSI tốt hơn đáng kể VÀ route đã ổn định
+                uint32_t route_age = now - e->last_update_time;
+                if (new_rssi != -127 && old_rssi != -127 && 
+                    new_rssi >= old_rssi + 10 &&
+                    route_age > ROUTE_SETTLE_TIME_MS) {
                     e->next_hop = next_hop;
                     e->hop_count = hop_count;
                     e->last_update_time = now;
@@ -662,7 +685,9 @@ static void dsdv_upsert(uint16_t dest, uint16_t next_hop, uint8_t hop_count, uin
 out:
     if (local_changed) {
         if(g_chat_cli_instance && g_chat_cli_instance->model) {
-            k_work_reschedule(&dsdv_update_work, K_MSEC(800 + (sys_rand32_get() % 400)));
+            // Tăng delay trước khi gửi UPDATE sau khi route thay đổi
+            // Chờ 1.5-3s để gom nhiều thay đổi vào 1 UPDATE
+            k_work_reschedule(&dsdv_update_work, K_MSEC(1500 + (sys_rand32_get() % 1500)));
         }
     }
 }
