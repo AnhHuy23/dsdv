@@ -32,6 +32,7 @@
 #define NEIGHBOR_RSSI_VALID_WINDOW_MS 90000  // Tăng lên 90s - giữ RSSI data lâu hơn
 #define MAX_ROUTE_HISTORY 5
 #define ROUTE_SETTLE_TIME_MS 10000  // Route phải ổn định ít nhất 10s trước khi cho phép switch
+#define UPDATE_MIN_INTERVAL_MS 3000  // Rate limit: tối thiểu 3s giữa 2 UPDATE liên tiếp
 
 #define TTL_HELLO           1   
 #define TTL_UPDATE_CAP      3   
@@ -74,6 +75,7 @@ static uint32_t g_dsdv_my_seq = 0;
 
 static bool dsdv_route_changed = false;
 static bool dsdv_my_info_changed = false;
+static uint32_t last_update_sent_time = 0;  // Timestamp của UPDATE gần nhất (rate limiter)
 
 static struct {
     uint16_t addr;
@@ -313,12 +315,28 @@ static void dsdv_send_hello(struct k_work *work){
     dsdv_cleanup_expired_routes();
     
     if (dsdv_route_changed) {
-        k_work_reschedule(&dsdv_update_work, K_MSEC(500 + (sys_rand32_get() % 500)));
+        // Rate limit: chờ ít nhất UPDATE_MIN_INTERVAL_MS từ lần gửi trước
+        uint32_t now = k_uptime_get_32();
+        uint32_t since_last = now - last_update_sent_time;
+        uint32_t delay = (since_last < UPDATE_MIN_INTERVAL_MS) 
+                         ? (UPDATE_MIN_INTERVAL_MS - since_last + (sys_rand32_get() % 500))
+                         : (500 + (sys_rand32_get() % 500));
+        k_work_reschedule(&dsdv_update_work, K_MSEC(delay));
     }
     
-	// Tăng HELLO interval lên 6-12s để giảm traffic overhead
-	uint32_t jitter = sys_rand32_get() % 6000;
-	k_work_reschedule(&dsdv_hello_work, K_MSEC(6000 + jitter));
+	// Adaptive HELLO interval: tăng theo số routes đã biết
+	// Ít node (0-5): 8-14s | Nhiều node (10+): 15-25s
+	int route_count = 0;
+	for (int i = 0; i < DSDV_ROUTE_TABLE_SIZE; i++) {
+		if (g_dsdv_routes[i].dest != 0 && g_dsdv_routes[i].hop_count != 0xFF) {
+			route_count++;
+		}
+	}
+	// Base: 8s + 1s per route (capped at 15s) + jitter 0-10s
+	uint32_t hello_base = 8000 + (route_count * 1000);
+	if (hello_base > 15000) hello_base = 15000;
+	uint32_t jitter = sys_rand32_get() % 10000;
+	k_work_reschedule(&dsdv_hello_work, K_MSEC(hello_base + jitter));
 }
 
 static int handle_dsdv_hello(const struct bt_mesh_model *model,
@@ -463,6 +481,7 @@ static void dsdv_send_update(struct k_work *work)
     (void)bt_mesh_model_publish(g_chat_cli_instance->model);
 
     g_chat_cli_instance->model->pub->ttl = original_ttl;
+    last_update_sent_time = k_uptime_get_32();  // Ghi nhận thời điểm gửi UPDATE
 
     if (is_incremental) {
         dsdv_route_changed = false;
@@ -476,10 +495,16 @@ static void dsdv_send_update(struct k_work *work)
         dsdv_route_changed = false;
     }
 
-    // Tăng delay giữa các UPDATE để giảm storm
-    // Khi có thay đổi: chờ 2-4s thay vì 0.8-1.8s
-    // Khi ổn định: chờ 5-8s thay vì 3-4s
-    uint32_t base_delay = dsdv_route_changed ? 2000 : 5000;
+    // Adaptive UPDATE delay: tăng theo số routes để giảm traffic
+    // Ít route: 3-6s | Nhiều route: 8-15s
+    int active_routes = 0;
+    for (int i = 0; i < DSDV_ROUTE_TABLE_SIZE; i++) {
+        if (g_dsdv_routes[i].dest != 0 && g_dsdv_routes[i].hop_count != 0xFF) {
+            active_routes++;
+        }
+    }
+    uint32_t base_delay = dsdv_route_changed ? (3000 + active_routes * 200) : (8000 + active_routes * 300);
+    if (base_delay > 15000) base_delay = 15000;
     uint32_t jitter = sys_rand32_get() % 3000;
     k_work_reschedule(&dsdv_update_work, K_MSEC(base_delay + jitter));
 }
