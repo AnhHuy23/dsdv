@@ -61,12 +61,22 @@ extern "C" {
 									   BT_MESH_CHAT_CLI_VENDOR_COMPANY_ID)
 
 /* ============================================================================
+ * NODE ROLE ENUM — MCDS Backbone Selection
+ * ============================================================================ */
+
+/** Node role in the MCDS backbone hierarchy */
+typedef enum {
+    NODE_ROLE_UNKNOWN  = 0,  /**< Role not yet determined */
+    NODE_ROLE_BACKBONE = 1,  /**< Relay ON, full routing, higher TTL */
+    NODE_ROLE_LEAF     = 2,  /**< Relay OFF, local only, lower TTL */
+} node_role_t;
+
+/* ============================================================================
  * MESSAGE LENGTH CONSTANTS
  * ============================================================================ */
 									   
-#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_HELLO 8                /**< HELLO packet size */
+#define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_HELLO sizeof(struct dsdv_hello) /**< HELLO packet size */
 #define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_UPDATE_MIN 8           /**< Minimum UPDATE packet size */
-// #define BT_MESH_CHAT_CLI_MSG_LEN_NETWORK_METRICS 15       /**< DEPRECATED: Legacy standalone metrics */
 #define BT_MESH_CHAT_CLI_MSG_LEN_METRICS_ACK 8               /**< Metrics ACK packet size */
 #define BT_MESH_CHAT_CLI_MSG_LEN_DSDV_DATA_MAX 128           /**< Maximum DATA packet size */
 #define BT_MESH_CHAT_CLI_MSG_LEN_LED_TOGGLE 8                /**< LED toggle packet size */
@@ -128,13 +138,15 @@ struct dsdv_route_entry {
 /**
  * @brief DSDV HELLO packet structure
  * 
- * Broadcast every ~5 seconds for neighbor discovery.
- * Receivers create 1-hop routes and measure RSSI.
+ * Broadcast periodically for neighbor discovery.
+ * Receivers create 1-hop routes, measure RSSI, and learn neighbor degree/role
+ * for MCDS backbone selection.
  */
 struct dsdv_hello {
     uint16_t src;       /**< Source node address */
     uint32_t seq_num;   /**< Source's sequence number (even numbers only) */
-
+    uint8_t  my_degree; /**< Number of active neighbors (for backbone election) */
+    uint8_t  my_role;   /**< Current node role: NODE_ROLE_UNKNOWN/BACKBONE/LEAF */
 } __packed;
 
 /**
@@ -340,6 +352,23 @@ int bt_mesh_chat_cli_structure_request(struct bt_mesh_chat_cli *chat, uint16_t d
  * @retval -ENOENT No route to destination.
  */
 int bt_mesh_chat_cli_led_toggle_send(struct bt_mesh_chat_cli *chat, uint16_t dest);
+
+/** @brief Get the current node role (BACKBONE/LEAF/UNKNOWN).
+ * @return Current node_role_t value.
+ */
+node_role_t bt_mesh_chat_cli_get_node_role(void);
+
+/** @brief Get list of known backbone node addresses.
+ * @param[out] backbone_addrs Array to fill with backbone addresses.
+ * @param[in] max_count Maximum entries to return.
+ * @return Number of backbone nodes found.
+ */
+int bt_mesh_chat_cli_get_backbone_info(uint16_t *backbone_addrs, int max_count);
+
+/** @brief Get the current node's backbone score.
+ * @return Centrality score used in backbone election.
+ */
+uint16_t bt_mesh_chat_cli_get_backbone_score(void);
 
 /** @cond INTERNAL_HIDDEN */
 extern const struct bt_mesh_model_op _bt_mesh_chat_cli_op[];

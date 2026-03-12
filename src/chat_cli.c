@@ -35,9 +35,19 @@
 #define UPDATE_MIN_INTERVAL_MS 3000  // Rate limit: tối thiểu 3s giữa 2 UPDATE liên tiếp
 
 #define TTL_HELLO           1   
-#define TTL_UPDATE_CAP      3   
-#define TTL_BROADCAST_APP   2   
 #define TTL_DEFAULT_MAX     10  
+
+/* =========================================================================
+ * MCDS BACKBONE SELECTION CONSTANTS
+ * ============================================================================ */
+#define BACKBONE_RSSI_THRESHOLD     (-70)   // Min avg RSSI for backbone eligibility
+#define BACKBONE_RSSI_REJECT        (-80)   // Nodes below this are forced LEAF
+#define BACKBONE_MIN_DEGREE         3       // Minimum neighbors to be backbone-eligible
+#define BACKBONE_EVAL_INTERVAL_MS   30000   // Re-evaluate every 30s
+#define BACKBONE_INITIAL_DELAY_MS   15000   // Wait 15s after start before first eval
+#define BACKBONE_PDR_REJECT         50      // PDR < 50% → unreliable → force LEAF (0-100 scale)
+#define BACKBONE_PDR_WINDOW_MS      60000   // PDR measurement window: 60s
+#define BACKBONE_EXPECTED_HELLO_MS  12000   // Expected avg HELLO interval ~12s
 
 LOG_MODULE_DECLARE(chat);
 
@@ -101,6 +111,29 @@ static struct bt_mesh_chat_cli *g_chat_cli_instance = NULL;
 static struct dsdv_dup_cache g_dup_cache[DSDV_DUP_CACHE_SIZE];
 
 /* =========================================================================
+ * MCDS BACKBONE SELECTION STATE
+ * ============================================================================ */
+static node_role_t g_my_role = NODE_ROLE_UNKNOWN;
+static uint16_t g_my_degree = 0;
+static uint16_t g_my_backbone_score = 0;
+static struct k_work_delayable backbone_selection_work;
+
+/** Neighbor info cache — extended with degree/role/PDR from HELLO packets */
+static struct {
+    uint16_t addr;
+    uint8_t  degree;
+    uint8_t  role;          // node_role_t from neighbor's HELLO
+    int8_t   avg_rssi;
+    uint32_t last_seen;
+    /* PDR tracking: count HELLOs received in a rolling window */
+    uint16_t hello_rx_count;    // HELLOs received in current window
+    uint32_t pdr_window_start;  // Start time of current PDR window
+} neighbor_backbone_info[MAX_RSSI_NEIGHBORS];
+
+static void backbone_evaluate(void);
+static void backbone_selection_handler(struct k_work *work);
+
+/* =========================================================================
  * CORE LOGIC
  * ============================================================================ */
 
@@ -108,15 +141,19 @@ static uint8_t dsdv_calc_ttl(dsdv_msg_type_t type, uint16_t dst)
 {
     struct dsdv_route_entry *rt;
 
+    /* Role-adaptive TTL caps */
+    uint8_t ttl_update_cap   = (g_my_role == NODE_ROLE_BACKBONE) ? 4 : 2;
+    uint8_t ttl_broadcast    = (g_my_role == NODE_ROLE_BACKBONE) ? 3 : 1;
+
     switch (type) {
     case MSG_HELLO: return TTL_HELLO; 
-    case MSG_UPDATE: return TTL_UPDATE_CAP; 
+    case MSG_UPDATE: return ttl_update_cap; 
     case MSG_UNICAST_DATA:
         rt = find_route(dst);
-        if (!rt) return TTL_UPDATE_CAP; 
+        if (!rt) return ttl_update_cap; 
         uint8_t target_ttl = rt->hop_count + 1;
         return (target_ttl > TTL_DEFAULT_MAX) ? TTL_DEFAULT_MAX : target_ttl;
-    case MSG_BROADCAST_APP: return TTL_BROADCAST_APP; 
+    case MSG_BROADCAST_APP: return ttl_broadcast; 
     default: return 2;
     }
 }
@@ -287,7 +324,6 @@ static void dsdv_send_hello(struct k_work *work){
 	uint16_t my_addr = bt_mesh_model_elem(g_chat_cli_instance->model)->rt->addr;
 
     // Giảm tần suất tăng seq_num: mỗi ~80s thay vì ~30s
-    // Seq tăng chậm hơn = ít trigger full table update hơn
     static int keep_alive_cnt = 0;
     if (++keep_alive_cnt > 16) { 
          g_dsdv_my_seq += 2; 
@@ -295,9 +331,22 @@ static void dsdv_send_hello(struct k_work *work){
          dsdv_my_info_changed = true; 
     }
 
+    /* Calculate current degree for HELLO packet */
+    uint16_t active_neighbors = 0;
+    uint32_t now_hello = k_uptime_get_32();
+    for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+        if (neighbor_rssi[i].addr != 0 &&
+            (now_hello - neighbor_rssi[i].last_update) < NEIGHBOR_RSSI_VALID_WINDOW_MS) {
+            active_neighbors++;
+        }
+    }
+    g_my_degree = active_neighbors;
+
 	struct dsdv_hello hello = {
 		.src = my_addr,
-		.seq_num = g_dsdv_my_seq
+		.seq_num = g_dsdv_my_seq,
+		.my_degree = (active_neighbors > 255) ? 255 : (uint8_t)active_neighbors,
+		.my_role = (uint8_t)g_my_role,
 	};
 
 	struct net_buf_simple *pub = g_chat_cli_instance->model->pub->msg;
@@ -315,7 +364,6 @@ static void dsdv_send_hello(struct k_work *work){
     dsdv_cleanup_expired_routes();
     
     if (dsdv_route_changed) {
-        // Rate limit: chờ ít nhất UPDATE_MIN_INTERVAL_MS từ lần gửi trước
         uint32_t now = k_uptime_get_32();
         uint32_t since_last = now - last_update_sent_time;
         uint32_t delay = (since_last < UPDATE_MIN_INTERVAL_MS) 
@@ -324,15 +372,13 @@ static void dsdv_send_hello(struct k_work *work){
         k_work_reschedule(&dsdv_update_work, K_MSEC(delay));
     }
     
-	// Adaptive HELLO interval: tăng theo số routes đã biết
-	// Ít node (0-5): 8-14s | Nhiều node (10+): 15-25s
+	// Adaptive HELLO interval
 	int route_count = 0;
 	for (int i = 0; i < DSDV_ROUTE_TABLE_SIZE; i++) {
 		if (g_dsdv_routes[i].dest != 0 && g_dsdv_routes[i].hop_count != 0xFF) {
 			route_count++;
 		}
 	}
-	// Base: 8s + 1s per route (capped at 15s) + jitter 0-10s
 	uint32_t hello_base = 8000 + (route_count * 1000);
 	if (hello_base > 15000) hello_base = 15000;
 	uint32_t jitter = sys_rand32_get() % 10000;
@@ -355,11 +401,9 @@ static int handle_dsdv_hello(const struct bt_mesh_model *model,
     if (neighbor != dest) return 0;
 	if (dest == my_addr) return 0;
 	
-	// Hysteresis RSSI filtering cho ổn định
-	// Tăng threshold lên để chỉ chấp nhận neighbor có tín hiệu đủ mạnh
-	// Gap 5 dBm giữa existing và new để tránh flapping
+	// Hysteresis RSSI filtering
 	struct dsdv_route_entry *existing_route = find_route(dest);
-	int8_t rssi_threshold = existing_route ? -80 : -75;  // -80 cho existing, -75 cho new (gap 5 dBm)
+	int8_t rssi_threshold = existing_route ? -80 : -75;
 	
 	if (ctx->recv_rssi != 0 && ctx->recv_rssi < rssi_threshold) {
 		return 0;
@@ -368,6 +412,49 @@ static int handle_dsdv_hello(const struct bt_mesh_model *model,
 	if (ctx->recv_rssi != 0) {
 		update_neighbor_rssi(neighbor, ctx->recv_rssi);
 	}
+
+	/* MCDS: Store neighbor degree and role from HELLO for backbone election */
+	{
+		uint32_t now = k_uptime_get_32();
+		int free_slot = -1;
+		int oldest_slot = 0;
+		uint32_t oldest_time = UINT32_MAX;
+
+		for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+			if (neighbor_backbone_info[i].addr == neighbor) {
+				/* Update existing entry */
+				neighbor_backbone_info[i].degree = hello.my_degree;
+				neighbor_backbone_info[i].role = hello.my_role;
+				neighbor_backbone_info[i].avg_rssi = get_neighbor_rssi(neighbor);
+				neighbor_backbone_info[i].last_seen = now;
+				/* PDR: increment hello count, reset window if expired */
+				if ((now - neighbor_backbone_info[i].pdr_window_start) > BACKBONE_PDR_WINDOW_MS) {
+					neighbor_backbone_info[i].hello_rx_count = 1;
+					neighbor_backbone_info[i].pdr_window_start = now;
+				} else {
+					neighbor_backbone_info[i].hello_rx_count++;
+				}
+				goto backbone_info_done;
+			}
+			if (neighbor_backbone_info[i].addr == 0 && free_slot == -1) {
+				free_slot = i;
+			}
+			if (neighbor_backbone_info[i].last_seen < oldest_time) {
+				oldest_time = neighbor_backbone_info[i].last_seen;
+				oldest_slot = i;
+			}
+		}
+
+		int slot = (free_slot >= 0) ? free_slot : oldest_slot;
+		neighbor_backbone_info[slot].addr = neighbor;
+		neighbor_backbone_info[slot].degree = hello.my_degree;
+		neighbor_backbone_info[slot].role = hello.my_role;
+		neighbor_backbone_info[slot].avg_rssi = get_neighbor_rssi(neighbor);
+		neighbor_backbone_info[slot].last_seen = now;
+		neighbor_backbone_info[slot].hello_rx_count = 1;
+		neighbor_backbone_info[slot].pdr_window_start = now;
+	}
+backbone_info_done:
 
 	dsdv_upsert(dest, neighbor, 1, seq);
 	return 0;
@@ -800,6 +887,7 @@ static int bt_mesh_chat_cli_init(const struct bt_mesh_model *model)
     k_work_init_delayable(&dsdv_hello_work, dsdv_send_hello);
 	k_work_init_delayable(&dsdv_update_work, dsdv_send_update);
 	k_work_init_delayable(&print_routes_work, print_routes_handler);
+	k_work_init_delayable(&backbone_selection_work, backbone_selection_handler);
     return 0;
 }
 
@@ -814,6 +902,7 @@ static int bt_mesh_chat_cli_start(const struct bt_mesh_model *model)
 	k_work_schedule(&dsdv_hello_work, K_MSEC(2000 + (sys_rand32_get() % 5000)));
 	k_work_schedule(&dsdv_update_work, K_MSEC(3000 + (sys_rand32_get() % 2000)));
 	k_work_schedule(&print_routes_work, K_MSEC(10000));
+	k_work_schedule(&backbone_selection_work, K_MSEC(BACKBONE_INITIAL_DELAY_MS + (sys_rand32_get() % 5000)));
     return 0;
 }
 
@@ -840,6 +929,288 @@ int bt_mesh_chat_cli_get_neighbor_rssi(uint16_t *addrs, int8_t *rssi, int max_co
             addrs[count] = neighbor_rssi[i].addr;
             rssi[count] = neighbor_rssi[i].rssi;
             count++;
+        }
+    }
+    return count;
+}
+
+/* =========================================================================
+ * MCDS BACKBONE SELECTION ALGORITHM (5-Step Greedy Centrality)
+ * ============================================================================ */
+
+/**
+ * @brief Calculate average RSSI across all active neighbors
+ */
+static int8_t calc_avg_neighbor_rssi(void)
+{
+    int32_t sum = 0;
+    int count = 0;
+    uint32_t now = k_uptime_get_32();
+
+    for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+        if (neighbor_rssi[i].addr != 0 &&
+            (now - neighbor_rssi[i].last_update) < NEIGHBOR_RSSI_VALID_WINDOW_MS) {
+            sum += neighbor_rssi[i].rssi;
+            count++;
+        }
+    }
+    return (count > 0) ? (int8_t)(sum / count) : -127;
+}
+
+/**
+ * @brief Calculate per-neighbor average PDR (0-100 scale)
+ * PDR = (received_hellos / expected_hellos) * 100
+ * Expected hellos = window_duration / avg_hello_interval
+ */
+static uint8_t calc_avg_neighbor_pdr(void)
+{
+    uint32_t now = k_uptime_get_32();
+    uint32_t total_pdr = 0;
+    int count = 0;
+
+    for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+        if (neighbor_backbone_info[i].addr == 0) continue;
+        if ((now - neighbor_backbone_info[i].last_seen) > NEIGHBOR_RSSI_VALID_WINDOW_MS) continue;
+
+        uint32_t window_ms = now - neighbor_backbone_info[i].pdr_window_start;
+        if (window_ms < 5000) {
+            /* Window too short, assume 100% */
+            total_pdr += 100;
+            count++;
+            continue;
+        }
+
+        uint16_t expected = (uint16_t)(window_ms / BACKBONE_EXPECTED_HELLO_MS);
+        if (expected == 0) expected = 1;
+
+        uint16_t pdr = (neighbor_backbone_info[i].hello_rx_count * 100) / expected;
+        if (pdr > 100) pdr = 100;
+
+        total_pdr += pdr;
+        count++;
+    }
+
+    return (count > 0) ? (uint8_t)(total_pdr / count) : 0;
+}
+
+/**
+ * @brief Calculate backbone centrality score for a node
+ * Score = degree * 100 + rssi_normalized + pdr_bonus
+ * Higher score = more central = better backbone candidate
+ */
+static uint16_t calc_backbone_score_for(uint8_t degree, int8_t avg_rssi, uint8_t pdr)
+{
+    /* Normalize RSSI: map [-100, -30] -> [0, 70] */
+    int16_t rssi_score = (int16_t)(avg_rssi + 100);
+    if (rssi_score < 0) rssi_score = 0;
+    if (rssi_score > 70) rssi_score = 70;
+    /* PDR bonus: 0-30 points (pdr is 0-100, scale to 0-30) */
+    uint16_t pdr_bonus = (uint16_t)(pdr * 30 / 100);
+    /* Degree is the dominant factor */
+    return (uint16_t)(degree * 100) + (uint16_t)rssi_score + pdr_bonus;
+}
+
+/**
+ * @brief Step 3-5: Calculate score, greedy select, connectivity check
+ * Called periodically by backbone_selection_handler
+ */
+static void backbone_evaluate(void)
+{
+    if (!g_chat_cli_instance || !g_chat_cli_instance->model) return;
+
+    uint16_t my_addr = bt_mesh_model_elem(g_chat_cli_instance->model)->rt->addr;
+    uint32_t now = k_uptime_get_32();
+    node_role_t old_role = g_my_role;
+
+    /* --- Step 1: Recalculate degree (active neighbors) --- */
+    uint16_t active_neighbors = 0;
+    for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+        if (neighbor_rssi[i].addr != 0 &&
+            (now - neighbor_rssi[i].last_update) < NEIGHBOR_RSSI_VALID_WINDOW_MS) {
+            active_neighbors++;
+        }
+    }
+    g_my_degree = active_neighbors;
+
+    /* --- Step 2: Filter invalid nodes --- */
+    int8_t my_avg_rssi = calc_avg_neighbor_rssi();
+    uint8_t my_avg_pdr = calc_avg_neighbor_pdr();
+
+    if (g_my_degree < 2) {
+        /* Edge node: degree < 2, cannot be a bridge */
+        g_my_role = NODE_ROLE_LEAF;
+        g_my_backbone_score = 0;
+        LOG_INF("BACKBONE: LEAF (degree %u < 2, edge node)", g_my_degree);
+        goto apply_role;
+    }
+
+    if (my_avg_rssi < BACKBONE_RSSI_REJECT) {
+        /* Sensitive node: RSSI too low */
+        g_my_role = NODE_ROLE_LEAF;
+        g_my_backbone_score = 0;
+        LOG_INF("BACKBONE: LEAF (avg RSSI %d < %d, weak signal)", 
+                my_avg_rssi, BACKBONE_RSSI_REJECT);
+        goto apply_role;
+    }
+
+    if (my_avg_pdr < BACKBONE_PDR_REJECT) {
+        /* Unreliable node: packet delivery too low */
+        g_my_role = NODE_ROLE_LEAF;
+        g_my_backbone_score = 0;
+        LOG_INF("BACKBONE: LEAF (avg PDR %u%% < %d%%, unreliable)",
+                my_avg_pdr, BACKBONE_PDR_REJECT);
+        goto apply_role;
+    }
+
+    /* --- Step 3: Calculate centrality score --- */
+    uint16_t my_score = calc_backbone_score_for((uint8_t)g_my_degree, my_avg_rssi, my_avg_pdr);
+    g_my_backbone_score = my_score;
+
+    /* --- Step 4: Greedy Selection --- 
+     * Compare my score with all 1-hop neighbors.
+     * If I have the highest score, I become BACKBONE.
+     * Tie-breaker: smaller node address wins.
+     */
+    bool i_am_highest = true;
+
+    for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+        if (neighbor_backbone_info[i].addr == 0) continue;
+        if ((now - neighbor_backbone_info[i].last_seen) > NEIGHBOR_RSSI_VALID_WINDOW_MS) continue;
+
+        /* Estimate neighbor's score from their reported degree, measured RSSI, and observed PDR */
+        uint8_t nb_pdr = 100;
+        {
+            uint32_t w = now - neighbor_backbone_info[i].pdr_window_start;
+            if (w > 5000) {
+                uint16_t exp = (uint16_t)(w / BACKBONE_EXPECTED_HELLO_MS);
+                if (exp == 0) exp = 1;
+                nb_pdr = (uint8_t)((neighbor_backbone_info[i].hello_rx_count * 100) / exp);
+                if (nb_pdr > 100) nb_pdr = 100;
+            }
+        }
+        uint16_t neighbor_score = calc_backbone_score_for(
+            neighbor_backbone_info[i].degree,
+            neighbor_backbone_info[i].avg_rssi,
+            nb_pdr
+        );
+
+        if (neighbor_score > my_score) {
+            i_am_highest = false;
+            break;
+        } else if (neighbor_score == my_score) {
+            /* Tie-breaker: smaller address wins */
+            if (neighbor_backbone_info[i].addr < my_addr) {
+                i_am_highest = false;
+                break;
+            }
+        }
+    }
+
+    if (i_am_highest && g_my_degree >= BACKBONE_MIN_DEGREE && 
+        my_avg_rssi >= BACKBONE_RSSI_THRESHOLD) {
+        g_my_role = NODE_ROLE_BACKBONE;
+    } else {
+        g_my_role = NODE_ROLE_LEAF;
+    }
+
+    /* --- Step 5: Connectivity check --- 
+     * If no backbone neighbor exists for this node, and this node has the
+     * highest score in its cluster, force it to BACKBONE for connectivity.
+     */
+    if (g_my_role == NODE_ROLE_LEAF) {
+        bool has_backbone_neighbor = false;
+        bool i_have_highest_score_in_cluster = true;
+
+        for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
+            if (neighbor_backbone_info[i].addr == 0) continue;
+            if ((now - neighbor_backbone_info[i].last_seen) > NEIGHBOR_RSSI_VALID_WINDOW_MS) continue;
+
+            if (neighbor_backbone_info[i].role == NODE_ROLE_BACKBONE) {
+                has_backbone_neighbor = true;
+                break;
+            }
+
+            /* Also check if any neighbor has a higher score */
+            uint8_t ns_pdr = 100;
+            {
+                uint32_t w = now - neighbor_backbone_info[i].pdr_window_start;
+                if (w > 5000) {
+                    uint16_t exp = (uint16_t)(w / BACKBONE_EXPECTED_HELLO_MS);
+                    if (exp == 0) exp = 1;
+                    ns_pdr = (uint8_t)((neighbor_backbone_info[i].hello_rx_count * 100) / exp);
+                    if (ns_pdr > 100) ns_pdr = 100;
+                }
+            }
+            uint16_t ns = calc_backbone_score_for(
+                neighbor_backbone_info[i].degree,
+                neighbor_backbone_info[i].avg_rssi,
+                ns_pdr
+            );
+            if (ns > my_score || (ns == my_score && neighbor_backbone_info[i].addr < my_addr)) {
+                i_have_highest_score_in_cluster = false;
+            }
+        }
+
+        if (!has_backbone_neighbor && i_have_highest_score_in_cluster && g_my_degree >= 1) {
+            /* Isolated cluster: force highest-scoring node to BACKBONE */
+            g_my_role = NODE_ROLE_BACKBONE;
+            LOG_INF("BACKBONE: Forced BACKBONE (no backbone neighbor, highest in cluster)");
+        }
+    }
+
+    LOG_INF("BACKBONE: Role=%s Score=%u Degree=%u AvgRSSI=%d",
+            (g_my_role == NODE_ROLE_BACKBONE) ? "BACKBONE" : "LEAF",
+            g_my_backbone_score, g_my_degree, my_avg_rssi);
+
+apply_role:
+    /* Apply relay configuration based on role */
+    if (g_my_role != old_role) {
+#if defined(CONFIG_BT_MESH_CFG_SRV)
+        extern void bt_mesh_cfg_srv_relay_set(uint8_t new_relay, uint8_t new_transmit);
+        if (g_my_role == NODE_ROLE_BACKBONE) {
+            bt_mesh_cfg_srv_relay_set(BT_MESH_RELAY_ENABLED, BT_MESH_TRANSMIT(2, 20));
+            LOG_INF("BACKBONE: Relay ENABLED (Backbone node)");
+        } else {
+            bt_mesh_cfg_srv_relay_set(BT_MESH_RELAY_DISABLED, BT_MESH_TRANSMIT(2, 20));
+            LOG_INF("BACKBONE: Relay DISABLED (Leaf node)");
+        }
+#endif
+    }
+}
+
+/**
+ * @brief Periodic backbone evaluation timer handler
+ */
+static void backbone_selection_handler(struct k_work *work)
+{
+    backbone_evaluate();
+    k_work_reschedule(&backbone_selection_work, K_MSEC(BACKBONE_EVAL_INTERVAL_MS + (sys_rand32_get() % 5000)));
+}
+
+/* =========================================================================
+ * MCDS BACKBONE PUBLIC API
+ * ============================================================================ */
+
+node_role_t bt_mesh_chat_cli_get_node_role(void)
+{
+    return g_my_role;
+}
+
+uint16_t bt_mesh_chat_cli_get_backbone_score(void)
+{
+    return g_my_backbone_score;
+}
+
+int bt_mesh_chat_cli_get_backbone_info(uint16_t *backbone_addrs, int max_count)
+{
+    int count = 0;
+    uint32_t now = k_uptime_get_32();
+
+    for (int i = 0; i < MAX_RSSI_NEIGHBORS && count < max_count; i++) {
+        if (neighbor_backbone_info[i].addr != 0 &&
+            neighbor_backbone_info[i].role == NODE_ROLE_BACKBONE &&
+            (now - neighbor_backbone_info[i].last_seen) < NEIGHBOR_RSSI_VALID_WINDOW_MS) {
+            backbone_addrs[count++] = neighbor_backbone_info[i].addr;
         }
     }
     return count;

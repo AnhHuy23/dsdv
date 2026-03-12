@@ -336,6 +336,34 @@ static int cmd_led_toggle(const struct shell *shell, size_t argc, char *argv[])
     return 0;
 }
 
+static int cmd_backbone(const struct shell *shell, size_t argc, char *argv[])
+{
+    const char *role_str;
+    node_role_t role = bt_mesh_chat_cli_get_node_role();
+    
+    switch (role) {
+    case NODE_ROLE_BACKBONE: role_str = "BACKBONE (Relay ON)"; break;
+    case NODE_ROLE_LEAF:     role_str = "LEAF (Relay OFF)"; break;
+    default:                 role_str = "UNKNOWN (not yet evaluated)"; break;
+    }
+    
+    shell_print(shell, "=== MCDS Backbone Status ===");
+    shell_print(shell, "Role:    %s", role_str);
+    shell_print(shell, "Score:   %u", bt_mesh_chat_cli_get_backbone_score());
+    
+    /* Show backbone neighbors */
+    uint16_t bb_addrs[16];
+    int bb_count = bt_mesh_chat_cli_get_backbone_info(bb_addrs, 16);
+    
+    shell_print(shell, "Backbone neighbors: %d", bb_count);
+    for (int i = 0; i < bb_count; i++) {
+        shell_print(shell, "  0x%04x", bb_addrs[i]);
+    }
+    shell_print(shell, "===========================");
+    
+    return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(chat_cmds,
 	SHELL_CMD_ARG(status, NULL, "Print client status", cmd_status, 1, 0),
 	SHELL_CMD_ARG(metrics_to, NULL, "Send metrics to specific node <addr> via DSDV",
@@ -349,6 +377,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(chat_cmds,
               cmd_relay_config, 2, 0), /* Register relay command here */
 	SHELL_CMD_ARG(led_toggle, NULL, "Toggle LED on remote node <addr>",
 		      cmd_led_toggle, 2, 0),
+	SHELL_CMD_ARG(backbone, NULL, "Show MCDS backbone status",
+		      cmd_backbone, 1, 0),
 	SHELL_SUBCMD_SET_END
 );
 
