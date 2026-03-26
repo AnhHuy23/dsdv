@@ -1,0 +1,2 @@
+nodes,duration,sent,delivered,pdr,avg_latency_s,avg_hops,hello_packets,update_packets,drop_no_route,drop_link,route_changes
+10,25.0,9,2,0.2222222222222222,1.0,0.0,48,20,7,0,80
