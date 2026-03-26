@@ -1,0 +1,13 @@
+nodes: 80
+duration_s: 120.0
+sent: 46
+delivered: 16
+pdr: 0.34782608695652173
+avg_latency_s: 1.625
+avg_hops: 0.625
+hello_packets: 641
+update_packets: 630
+drop_no_route: 29
+drop_link: 0
+route_changes: 23363
+backbone_nodes: 2

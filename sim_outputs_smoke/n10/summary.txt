@@ -1,0 +1,13 @@
+nodes: 10
+duration_s: 15.0
+sent: 4
+delivered: 2
+pdr: 0.5
+avg_latency_s: 1.0
+avg_hops: 0.0
+hello_packets: 20
+update_packets: 10
+drop_no_route: 1
+drop_link: 0
+route_changes: 50
+backbone_nodes: 0
