@@ -10,6 +10,10 @@ Mô phỏng mạng WSN với thuật toán DSDV dựa trên logic code firmware 
 - Thu thập các thông số chính
 - Xuất video mô phỏng + bảng định tuyến mẫu
 
+## Topology (luôn liên thông)
+
+Các node được đặt trên **lưới (grid)** trong vùng `--area`, với khoảng cách giữa láng giềng lưới **≤ 0,95 × `--range`**. Như vậy đồ thị láng giềng theo tầm phủ sóng **luôn liên thông** (một thành phần), kể cả khi N nhỏ hay lớn — không còn trường hợp node “rơi rụng” ngẫu nhiên ngoài tầm.
+
 ## Cài môi trường
 
 ```bash

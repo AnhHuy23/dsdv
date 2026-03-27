@@ -1,0 +1,5 @@
+owner_node,dest,next_hop,hop_count,seq_num,age_s
+0,0,0,0,0,15.0
+0,1,1,1,6,1.0
+0,4,4,1,6,2.0
+0,5,1,2,2,11.0

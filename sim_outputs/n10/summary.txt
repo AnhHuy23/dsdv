@@ -1,0 +1,12 @@
+nodes: 10
+duration: 120.0
+sent: 47
+delivered: 39
+pdr: 0.8297872340425532
+avg_latency_s: 2.2051282051282053
+avg_hops: 1.205128205128205
+hello_packets: 218
+update_packets: 80
+drop_no_route: 7
+drop_link: 0
+route_changes: 1064

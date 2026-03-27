@@ -2,7 +2,8 @@
 WSN DSDV simulator (inspired by the project's embedded DSDV behavior).
 
 Features:
-- Random geometric WSN topology with basic radio model (RSSI from distance)
+- **Connected topology:** nodes placed on a grid with spacing ≤ radio range (always one connected component)
+- Basic radio model (RSSI from distance)
 - DSDV-like proactive routing (HELLO + UPDATE, sequence-based freshness)
 - Periodic data traffic generation and packet forwarding by routing table
 - Metrics collection: PDR, avg latency, avg hops, control/data packet counters
@@ -20,7 +21,7 @@ import argparse
 import csv
 import math
 import random
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
@@ -100,6 +101,7 @@ class WsnDsdvSim:
         self.dt = dt
         self.duration = duration
         self.data_period = data_period
+        self.seed = seed
 
         self.nodes: List[Node] = []
         self.time = 0.0
@@ -121,11 +123,45 @@ class WsnDsdvSim:
 
         self._init_nodes()
 
+    def _grid_positions(self) -> List[Tuple[float, float]]:
+        """Place N nodes on a 4-connected grid so every node has a path of edges ≤ radio_range.
+
+        Neighbors along the grid are at distance `s` with `s ≤ 0.95 * radio_range`, so the
+        geometric graph contains a spanning grid → always connected for N ≥ 1.
+        """
+        n = self.n_nodes
+        area = self.area_size
+        r = self.radio_range * 0.95
+        if n <= 0:
+            return []
+        if n == 1:
+            return [(area / 2.0, area / 2.0)]
+
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+        # Max spacing that fits in area along each axis
+        sx = area / max(1, cols - 1)
+        sy = area / max(1, rows - 1)
+        s = min(r, sx, sy)
+        total_w = (cols - 1) * s
+        total_h = (rows - 1) * s
+        ox = (area - total_w) / 2.0
+        oy = (area - total_h) / 2.0
+
+        positions: List[Tuple[float, float]] = []
+        for i in range(n):
+            row = i // cols
+            col = i % cols
+            x = ox + col * s
+            y = oy + row * s
+            positions.append((x, y))
+        return positions
+
     def _init_nodes(self) -> None:
         self.nodes.clear()
+        positions = self._grid_positions()
         for i in range(self.n_nodes):
-            x = self.rng.uniform(0, self.area_size)
-            y = self.rng.uniform(0, self.area_size)
+            x, y = positions[i]
             node = Node(nid=i, x=x, y=y)
             node.next_hello = self.rng.uniform(0.0, 2.0)
             node.next_update = self.rng.uniform(1.5, 4.0)
@@ -455,7 +491,7 @@ class WsnDsdvSim:
             dt=self.dt,
             duration=self.duration,
             data_period=self.data_period,
-            seed=42,
+            seed=self.seed,
         )
         frames = int(self.duration / self.dt)
         frame_states = []
