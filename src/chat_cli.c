@@ -132,6 +132,9 @@ static struct dsdv_route_entry* find_route(uint16_t dest){
     for (int i = 0; i < DSDV_ROUTE_TABLE_SIZE; ++i) {
         if (g_dsdv_routes[i].dest == dest) {
             struct dsdv_route_entry *e = &g_dsdv_routes[i];
+            if (e->hop_count == 0xFF) {
+                return NULL;
+            }
             bool is_direct_neighbor = (e->dest == e->next_hop && e->hop_count == 1);
             uint32_t timeout = is_direct_neighbor ? DSDV_NEIGHBOR_TIMEOUT_MS
                                                   : DSDV_ROUTE_TIMEOUT_MS;

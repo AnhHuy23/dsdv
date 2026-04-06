@@ -14,12 +14,18 @@ Chạy:
   - topology.png: vị trí node + liên kết vật lý + đánh dấu gateway
   - metrics_chart.png: PDR, latency, hops, gói điều khiển theo thời gian
   - simulation.mp4 hoặc .gif: năng lượng node theo thời gian (khi --video)
+
+Ghi chú đo lường:
+  - avg_latency: trễ vật lý theo deliver_time (không phải hàng đợi kiểu queue); hàng đợi sự kiện dùng heap.
+  - route_changes: chỉ tăng khi next_hop hoặc hop_count thực sự đổi (HELLO chỉ làm mới seq không tính).
+  - drop_link: mặc định 0 (kênh lý tưởng); dùng --link-loss > 0 để mô phỏng mất gói trên hop.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import math
 import random
 from collections import deque
@@ -414,13 +420,18 @@ def generate_random_topology(
     extra_edge_factor: float,
     max_attempts: int,
 ) -> Tuple[Dict[int, List[int]], Dict[int, Tuple[float, float]]]:
-    dmax = _max_distance_from_rssi_threshold(
-        rssi_1m=rssi_1m, path_loss_n=path_loss_n, rssi_threshold=rssi_threshold
-    )
-
     last_err: Optional[Exception] = None
     base_seed = seed if seed is not None else random.randint(1, 10**9)
     for k in range(max_attempts):
+        # N nhỏ: vị trí ngẫu nhiên dễ tạo cluster / không đủ cạnh ứng viên.
+        # Nới ngưỡng RSSI (âm hơn) → dmax lớn hơn. Thêm nới theo k nếu vẫn kẹt.
+        relax_db = (k // 25) * 2.0
+        if n_nodes <= 24:
+            relax_db += 10.0
+        rssi_eff = max(-120.0, rssi_threshold - relax_db)
+        dmax = _max_distance_from_rssi_threshold(
+            rssi_1m=rssi_1m, path_loss_n=path_loss_n, rssi_threshold=rssi_eff
+        )
         pos = generate_positions(
             n_nodes=n_nodes,
             area_w=area_w,
@@ -519,16 +530,18 @@ class DsdvEnvSim:
         extra_edge_factor: float = 1.4,
         max_attempts: int = 300,
         # DSDV protocol knobs
-        hello_interval: float = 5.0,
-        update_interval: float = 15.0,
-        route_timeout: float = 45.0,
-        update_payload_limit: int = 12,
+        hello_interval: float = 3.5,
+        update_interval: float = 8.0,
+        route_timeout: float = 60.0,
+        update_payload_limit: int = 0,
         # traffic knobs
         data_period: float = 2.5,
+        data_warmup_s: float = 35.0,
         # energy knobs
         initial_energy: float = 1000.0,
         energy_per_tx: float = 0.01,
         energy_per_rx: float = 0.005,
+        link_loss_prob: float = 0.0,
     ) -> None:
         self.rng = random.Random(seed)
         self.n_nodes = n_nodes
@@ -552,17 +565,25 @@ class DsdvEnvSim:
         self.hello_interval = hello_interval
         self.update_interval = update_interval
         self.route_timeout = route_timeout
-        self.update_payload_limit = update_payload_limit
+        # 0 = tự đặt N-1 (đủ entry để UPDATE không bị cắt → giảm drop_no_route)
+        if update_payload_limit <= 0:
+            uplim = max(1, n_nodes - 1)
+        else:
+            uplim = min(update_payload_limit, max(1, n_nodes - 1))
+        self.update_payload_limit = uplim
 
         self.data_period = data_period
+        self.data_warmup_s = max(0.0, data_warmup_s)
 
         self.initial_energy = initial_energy
         self.energy_per_tx = energy_per_tx
         self.energy_per_rx = energy_per_rx
+        self.link_loss_prob = max(0.0, min(1.0, link_loss_prob))
 
         self.time = 0.0
-        self.in_flight: Deque[Message] = deque()
-        self.next_data_at = 4.0
+        self._in_flight_heap: List[Tuple[float, int, Message]] = []
+        self._in_flight_seq = 0
+        self.next_data_at = self.data_warmup_s
 
         # topology
         self.adj: Dict[int, List[int]] = {}
@@ -643,6 +664,10 @@ class DsdvEnvSim:
     def _has_link(self, u: int, v: int) -> bool:
         return v in self.adj.get(u, [])
 
+    def _enqueue_msg(self, msg: Message) -> None:
+        heapq.heappush(self._in_flight_heap, (msg.deliver_time, self._in_flight_seq, msg))
+        self._in_flight_seq += 1
+
     def _broadcast(self, sender_id: int, kind: str, payload: dict) -> None:
         sender = self.nodes[sender_id]
         if sender.energy <= 0.0:
@@ -660,7 +685,7 @@ class DsdvEnvSim:
             d = self._dist(sender, receiver)
             # propagation: giữ tinh thần wsn_dsdv_sim (delay tăng theo khoảng cách)
             propagation = 0.03 + d / 450.0
-            self.in_flight.append(
+            self._enqueue_msg(
                 Message(
                     kind=kind,
                     src=sender_id,
@@ -671,7 +696,17 @@ class DsdvEnvSim:
                 )
             )
 
-    def _unicast(self, sender_id: int, next_hop: int, kind: str, payload: dict) -> bool:
+    def _unicast(
+        self,
+        sender_id: int,
+        next_hop: int,
+        kind: str,
+        payload: dict,
+        *,
+        send_time: Optional[float] = None,
+    ) -> bool:
+        """send_time: thời điểm gửi (thường là msg.deliver_time khi forward trong cùng bước)."""
+        base = self.time if send_time is None else send_time
         s = self.nodes[sender_id]
         r = self.nodes[next_hop]
         if s.energy <= 0.0 or r.energy <= 0.0:
@@ -682,16 +717,19 @@ class DsdvEnvSim:
             return False
 
         s.energy -= self.energy_per_tx
+        if self.link_loss_prob > 0.0 and self.rng.random() < self.link_loss_prob:
+            self.dropped_link += 1
+            return False
         d = self._dist(s, r)
         propagation = 0.04 + d / 450.0
-        self.in_flight.append(
+        self._enqueue_msg(
             Message(
                 kind=kind,
                 src=payload.get("src", sender_id),
                 sender=sender_id,
                 dst=next_hop,
                 payload=payload,
-                deliver_time=self.time + propagation,
+                deliver_time=base + propagation,
             )
         )
         return True
@@ -718,14 +756,16 @@ class DsdvEnvSim:
             self.route_changes += 1
             return
 
-        # DSDV freshness first: seq_num lớn hơn -> ưu tiên
+        # DSDV freshness first: seq_num lớn hơn -> ưu tiên (chỉ đếm route_changes khi đường đi đổi)
         if seq_num > old.seq_num:
+            path_changed = (next_hop != old.next_hop) or (hop_count != old.hop_count)
             old.next_hop = next_hop
             old.hop_count = hop_count
             old.seq_num = seq_num
             old.last_update = self.time
             old.changed = True
-            self.route_changes += 1
+            if path_changed:
+                self.route_changes += 1
             return
 
         # Cùng seq: hop tốt hơn -> cập nhật
@@ -816,7 +856,7 @@ class DsdvEnvSim:
                 seq_num=seq,
             )
 
-    def _forward_data(self, at: Node, payload: dict) -> None:
+    def _forward_data(self, at: Node, payload: dict, send_time: float) -> None:
         dest = payload["dest"]
         r = at.route_to(dest, self.time, self.route_timeout)
         if not r:
@@ -826,7 +866,7 @@ class DsdvEnvSim:
         payload["hop_count"] += 1
         payload["path"].append(at.nid)
 
-        ok = self._unicast(at.nid, r.next_hop, "data", payload)
+        ok = self._unicast(at.nid, r.next_hop, "data", payload, send_time=send_time)
         if not ok:
             self.dropped_link += 1
 
@@ -836,12 +876,12 @@ class DsdvEnvSim:
             receiver.recv_data += 1
             self.data_delivered += 1
             self.total_hops += p["hop_count"]
-            self.total_latency += self.time - p["created_at"]
+            self.total_latency += msg.deliver_time - p["created_at"]
             return
         if receiver.energy <= 0.0:
             self.dropped_link += 1
             return
-        self._forward_data(receiver, p)
+        self._forward_data(receiver, p, send_time=msg.deliver_time)
 
     def _gen_data_packet(self) -> None:
         # chọn src/dst ngẫu nhiên
@@ -875,9 +915,10 @@ class DsdvEnvSim:
         if not ok:
             self.dropped_link += 1
 
-    def _process_in_flight(self) -> None:
-        while self.in_flight and self.in_flight[0].deliver_time <= self.time:
-            msg = self.in_flight.popleft()
+    def _process_in_flight(self, time_limit: float) -> None:
+        """Giao tất cả gói có deliver_time <= time_limit (thường là cuối bước dt)."""
+        while self._in_flight_heap and self._in_flight_heap[0][0] <= time_limit:
+            _, _, msg = heapq.heappop(self._in_flight_heap)
             if msg.dst is None:
                 continue
             receiver = self.nodes[msg.dst]
@@ -932,15 +973,15 @@ class DsdvEnvSim:
             self._gen_data_packet()
             self.next_data_at += self.data_period
 
-        self._process_in_flight()
+        step_end = self.time + self.dt
+        self._process_in_flight(step_end)
+        self.time = step_end
         self._collect_sample()
 
         if self._video_recording and len(self._video_frames) < self._video_max_frames:
             self._video_step_counter += 1
             if self._video_step_counter % self._video_stride == 0:
                 self._video_frames.append((self.time, [n.energy for n in self.nodes]))
-
-        self.time += self.dt
 
     def run(
         self,
@@ -1038,18 +1079,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-rssi-amp", type=float, default=2.0)
 
     # protocol
-    p.add_argument("--hello", type=float, default=5.0, help="HELLO interval (s)")
-    p.add_argument("--update", type=float, default=15.0, help="UPDATE interval (s)")
-    p.add_argument("--timeout", type=float, default=45.0, help="Route timeout (s)")
-    p.add_argument("--update-payload-limit", type=int, default=12)
+    p.add_argument("--hello", type=float, default=3.5, help="HELLO interval (s)")
+    p.add_argument("--update", type=float, default=8.0, help="UPDATE interval (s)")
+    p.add_argument("--timeout", type=float, default=60.0, help="Route timeout (s)")
+    p.add_argument(
+        "--update-payload-limit",
+        type=int,
+        default=0,
+        help="Số entry tối đa mỗi gói UPDATE (0 = tự đặt N-1, khuyến nghị để PDR ổn định)",
+    )
 
     # traffic
     p.add_argument("--data-period", type=float, default=2.5)
+    p.add_argument(
+        "--data-warmup",
+        type=float,
+        default=35.0,
+        help="Không sinh DATA trước mốc này (s), để DSDV kịp hội tụ",
+    )
 
     # energy
     p.add_argument("--initial-energy", type=float, default=1000.0)
     p.add_argument("--energy-per-tx", type=float, default=0.01)
     p.add_argument("--energy-per-rx", type=float, default=0.005)
+    p.add_argument(
+        "--link-loss",
+        type=float,
+        default=0.0,
+        help="Xác suất mất gói trên mỗi hop unicast DATA (0 = kênh lý tưởng, drop_link vẫn 0)",
+    )
 
     p.add_argument(
         "--no-plots",
@@ -1096,9 +1154,11 @@ def main() -> None:
         route_timeout=args.timeout,
         update_payload_limit=args.update_payload_limit,
         data_period=args.data_period,
+        data_warmup_s=args.data_warmup,
         initial_energy=args.initial_energy,
         energy_per_tx=args.energy_per_tx,
         energy_per_rx=args.energy_per_rx,
+        link_loss_prob=args.link_loss,
     )
 
     sim.run(

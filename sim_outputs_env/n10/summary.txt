@@ -1,0 +1,10 @@
+pdr: 1.0
+avg_latency_s: 0.23976649865756564
+avg_hops: 1.3823529411764706
+hello_packets: 289
+update_packets: 137
+data_sent: 34
+data_delivered: 34
+drop_no_route: 0
+drop_link: 0
+route_changes: 116
