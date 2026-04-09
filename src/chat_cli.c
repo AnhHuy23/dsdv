@@ -565,7 +565,7 @@ static void dsdv_send_update(struct k_work *work)
     uint8_t original_ttl = g_chat_cli_instance->model->pub->ttl;
     g_chat_cli_instance->model->pub->ttl = dsdv_calc_ttl(MSG_UPDATE, BT_MESH_ADDR_ALL_NODES);
 
-    (void)bt_mesh_model_publish(g_chat_cli_instance->model);
+    (void)bt_mesh_model_publish(gx_chat_cli_instance->model);
 
     g_chat_cli_instance->model->pub->ttl = original_ttl;
     last_update_sent_time = k_uptime_get_32();  // Ghi nhận thời điểm gửi UPDATE
