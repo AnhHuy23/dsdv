@@ -61,6 +61,8 @@ HELLO_RSSI_MARGIN_EXISTING = 4.0
 BACKBONE_RSSI_THRESHOLD = -70.0
 BACKBONE_RSSI_REJECT = -80.0
 BACKBONE_MIN_DEGREE = 3
+BACKBONE_PROMOTE_MIN_DEGREE = 2
+BACKBONE_PROMOTE_RSSI_THRESHOLD = -80.0
 BACKBONE_EVAL_INTERVAL_S = 30.0
 BACKBONE_INITIAL_DELAY_S = 15.0
 BACKBONE_PDR_REJECT = 50.0
@@ -131,18 +133,18 @@ def plot_topology_png(
     ax.scatter(xs, ys, s=56, c=node_colors, edgecolors="white", linewidths=0.7, zorder=3)
     ax.scatter([positions[gateway_id][0]], [positions[gateway_id][1]], s=140, c="#d62728",
                marker="*", edgecolors="white", linewidths=1.0, zorder=4, label="Gateway")
-    if roles is not None:
-        backbone_nodes = [idx for idx, role in enumerate(roles) if role == ROLE_BACKBONE]
-        if backbone_nodes:
-            for src in backbone_nodes:
-                x0, y0 = positions[src]
-                for dst in adjacency.get(src, []):
-                    if dst <= src or roles[dst] != ROLE_BACKBONE:
-                        continue
-                    x1, y1 = positions[dst]
-                    ax.plot([x0, x1], [y0, y1], color="#d62728", linewidth=1.8, alpha=0.7, zorder=2)
     for idx, (x, y) in enumerate(positions):
-        ax.text(x + 1.2, y + 1.2, str(idx), fontsize=8, color="#222222")
+        ax.annotate(
+            str(idx),
+            xy=(x, y),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=8,
+            color="#222222",
+            ha="left",
+            va="bottom",
+            zorder=5,
+        )
 
     ax.set_title(title)
     ax.set_xlabel("X (m)")
@@ -236,7 +238,19 @@ def save_topology_animation(
                                marker="*", edgecolors="white", linewidths=1.0, zorder=4)
     labels = []
     for idx, (x, y) in enumerate(positions):
-        labels.append(ax.text(x + 1.2, y + 1.2, str(idx), fontsize=8, color="#222222"))
+        labels.append(
+            ax.annotate(
+                str(idx),
+                xy=(x, y),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=8,
+                color="#222222",
+                ha="left",
+                va="bottom",
+                zorder=5,
+            )
+        )
 
     edge_lines = []
     for src, neighbors in adjacency.items():
@@ -247,19 +261,6 @@ def save_topology_animation(
             x1, y1 = positions[dst]
             line, = ax.plot([x0, x1], [y0, y1], color="#8aa0b8", linewidth=0.8, alpha=0.45)
             edge_lines.append(line)
-
-    backbone_lines = []
-    if roles is not None:
-        for src, neighbors in adjacency.items():
-            if roles[src] != ROLE_BACKBONE:
-                continue
-            x0, y0 = positions[src]
-            for dst in neighbors:
-                if dst <= src or roles[dst] != ROLE_BACKBONE:
-                    continue
-                x1, y1 = positions[dst]
-                line, = ax.plot([x0, x1], [y0, y1], color="#d62728", linewidth=1.8, alpha=0.7)
-                backbone_lines.append(line)
 
     title_artist = ax.set_title(title)
     ax.set_xlabel("X (m)")
@@ -272,7 +273,7 @@ def save_topology_animation(
         norm = [max(0.0, min(1.0, float(value))) for value in energy]
         scatter.set_array(norm)
         title_artist.set_text(f"{title} | t={frame['t']:.1f}s")
-        return [scatter, gateway_point, title_artist, *labels, *edge_lines, *backbone_lines]
+        return [scatter, gateway_point, title_artist, *labels, *edge_lines]
 
     anim = FuncAnimation(fig, _update, frames=frames, interval=max(1, int(1000 / max(1, fps))), blit=False)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,9 +370,10 @@ def constrained_connectivity_graph(
         unconnected.remove(dst)
 
     extra_target = max(0, int(round(extra_edge_factor * node_count)))
-    rng.shuffle(candidate_edges)
+    # Prefer short extra edges so the rendered topology matches intuitive local connectivity.
+    extra_candidates = sorted(candidate_edges, key=lambda item: item[0])
     added = 0
-    for _, i, j in candidate_edges:
+    for _, i, j in extra_candidates:
         if added >= extra_target:
             break
         if j in adjacency[i]:
@@ -482,6 +484,7 @@ class Node:
     pending_data: Deque[Dict[str, Any]] = field(default_factory=deque)
     pending_ack_seq: Optional[int] = None
     pending_ack_deadline: float = 0.0
+    attached_backbone: Optional[int] = None
 
 
 class DsdvEnvSim:
@@ -641,6 +644,64 @@ class DsdvEnvSim:
         pdr_bonus = int(pdr * 30.0 / 100.0)
         return degree * 100 + rssi_score + pdr_bonus
 
+    def _select_leaf_backbone(self, node: Node) -> Optional[int]:
+        candidates: List[Tuple[int, float, int, int]] = []
+        for peer in node.backbone_peers.values():
+            if peer.role != ROLE_BACKBONE:
+                continue
+            if self.time - peer.last_seen > NEIGHBOR_RSSI_VALID_WINDOW_S:
+                continue
+            if peer.addr not in self.adjacency[node.node_id]:
+                continue
+            link_rssi = float(node.neighbor_rssi.get(peer.addr, peer.avg_rssi))
+            if link_rssi < BACKBONE_RSSI_REJECT:
+                continue
+            candidates.append((peer.addr, link_rssi, int(peer.degree), int(peer.hello_rx_count)))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (-item[1], -item[2], -item[3], item[0]))
+        best_id, best_rssi, _, _ = candidates[0]
+
+        # Keep current parent unless a new one is clearly better, reducing parent flaps.
+        if node.attached_backbone is not None:
+            for cand_id, cand_rssi, _, _ in candidates:
+                if cand_id == node.attached_backbone:
+                    if (best_rssi - cand_rssi) < 3.0:
+                        return node.attached_backbone
+                    break
+        return best_id
+
+    def _enforce_leaf_single_parent_routes(self, node: Node) -> None:
+        if node.role != ROLE_LEAF:
+            return
+
+        parent = node.attached_backbone
+        drop_dests: List[int] = []
+        for dest, entry in node.routes.items():
+            if dest == node.node_id:
+                continue
+            if parent is None:
+                drop_dests.append(dest)
+                continue
+            if entry.next_hop != parent:
+                drop_dests.append(dest)
+                continue
+            if entry.hop_count == 1 and dest != parent:
+                drop_dests.append(dest)
+
+        for dest in drop_dests:
+            node.routes.pop(dest, None)
+
+        if parent is not None and parent in self._active_neighbors(node):
+            parent_entry = node.routes.get(parent)
+            if parent_entry is None or parent_entry.hop_count >= INF_HOPS:
+                seq_num = int(parent_entry.seq_num) if parent_entry is not None else 0
+                node.routes[parent] = RouteEntry(parent, parent, 1, seq_num, self.time, True)
+                node.route_changed = True
+                self.counters["route_changes"] += 1
+
     def _update_backbone_peer(self, node: Node, neighbor_id: int, degree: int, role: int, avg_rssi: float) -> None:
         info = node.backbone_peers.get(neighbor_id)
         now = self.time
@@ -660,14 +721,25 @@ class DsdvEnvSim:
 
     def _evaluate_backbone(self, node: Node) -> None:
         old_role = node.role
+        old_parent = node.attached_backbone
         degree = len(self._active_neighbors(node))
         node.degree = degree
         avg_rssi = self._calc_avg_neighbor_rssi(node)
         avg_pdr = self._calc_avg_neighbor_pdr(node)
 
-        if degree < 2 or avg_rssi < BACKBONE_RSSI_REJECT or avg_pdr < BACKBONE_PDR_REJECT:
+        # Full-case role partitioning:
+        # 1) Hard reject => LEAF.
+        # 2) Strong winner => BACKBONE.
+        # 3) Otherwise => LEAF (single-parent policy).
+        # 4) If isolated from any backbone, constrained promote to BACKBONE.
+        if degree == 0:
             node.role = ROLE_LEAF
             node.backbone_score = 0
+            node.attached_backbone = None
+        elif degree < 2 or avg_rssi < BACKBONE_RSSI_REJECT or avg_pdr < BACKBONE_PDR_REJECT:
+            node.role = ROLE_LEAF
+            node.backbone_score = 0
+            node.attached_backbone = self._select_leaf_backbone(node)
         else:
             my_score = self._calc_backbone_score(degree, avg_rssi, avg_pdr)
             node.backbone_score = my_score
@@ -685,17 +757,33 @@ class DsdvEnvSim:
                     i_am_highest = False
                     break
 
-            if i_am_highest and degree >= BACKBONE_MIN_DEGREE and avg_rssi >= BACKBONE_RSSI_THRESHOLD:
+            if (
+                i_am_highest
+                and degree >= BACKBONE_MIN_DEGREE
+                and avg_rssi >= BACKBONE_RSSI_THRESHOLD
+                and avg_pdr >= BACKBONE_PDR_REJECT
+            ):
                 node.role = ROLE_BACKBONE
             else:
                 node.role = ROLE_LEAF
 
             if node.role == ROLE_LEAF:
-                has_backbone_neighbor = any(peer.role == ROLE_BACKBONE and self.time - peer.last_seen < NEIGHBOR_RSSI_VALID_WINDOW_S for peer in node.backbone_peers.values())
-                if not has_backbone_neighbor and degree >= 1:
+                node.attached_backbone = self._select_leaf_backbone(node)
+                if (
+                    node.attached_backbone is None
+                    and degree >= BACKBONE_PROMOTE_MIN_DEGREE
+                    and avg_rssi >= BACKBONE_PROMOTE_RSSI_THRESHOLD
+                    and avg_pdr >= BACKBONE_PDR_REJECT
+                ):
                     node.role = ROLE_BACKBONE
+            if node.role == ROLE_BACKBONE:
+                node.attached_backbone = None
 
-        if node.role != old_role:
+        if node.role == ROLE_LEAF:
+            # Strict policy: a leaf keeps at most one backbone uplink and no leaf->leaf chain.
+            self._enforce_leaf_single_parent_routes(node)
+
+        if node.role != old_role or node.attached_backbone != old_parent:
             node.my_info_changed = True
 
     def _ttl_cap(self, node: Node, kind: str) -> int:
@@ -807,6 +895,14 @@ class DsdvEnvSim:
     def _upsert_route(self, node: Node, dest: int, next_hop: int, hop_count: int, seq_num: int) -> bool:
         if dest == node.node_id:
             return False
+        if node.role == ROLE_LEAF:
+            parent = node.attached_backbone
+            if parent is None:
+                return False
+            if next_hop != parent:
+                return False
+            if hop_count == 1 and dest != parent:
+                return False
         if self.backbone_forward_only and hop_count > 1:
             if not (0 <= next_hop < self.node_count):
                 return False
@@ -1135,6 +1231,15 @@ class DsdvEnvSim:
         peer_degree = int(msg.payload.get("my_degree", 0))
         peer_role = int(msg.payload.get("my_role", ROLE_UNKNOWN))
         self._update_backbone_peer(node, src, peer_degree, peer_role, rssi)
+
+        if node.role == ROLE_LEAF:
+            if peer_role != ROLE_BACKBONE:
+                return
+            if node.attached_backbone is None:
+                node.attached_backbone = src
+                node.my_info_changed = True
+            elif src != node.attached_backbone:
+                return
         self._upsert_route(node, src, src, 1, seq)
 
     def _handle_update(self, node: Node, msg: Message) -> None:
@@ -1144,6 +1249,12 @@ class DsdvEnvSim:
         sender_role = int(msg.payload.get("sender_role", ROLE_UNKNOWN))
         if self.backbone_forward_only and sender_role != ROLE_BACKBONE:
             return
+        if node.role == ROLE_LEAF:
+            if node.attached_backbone is None and sender_role == ROLE_BACKBONE:
+                node.attached_backbone = sender
+                node.my_info_changed = True
+            if node.attached_backbone is None or sender != node.attached_backbone:
+                return
         rssi = float(msg.payload.get("rssi", self._link_rssi(sender, node.node_id)))
         self._update_neighbor_rssi(node, sender, rssi)
         entries = msg.payload.get("entries", [])
@@ -1560,7 +1671,7 @@ class DsdvEnvSim:
         return out_path
 
     def _topology_frame_title(self) -> str:
-        return f"WSN topology | nodes={self.node_count} | dmax={self.dmax:.1f} m"
+        return f"WSN topology | nodes={self.node_count}"
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:

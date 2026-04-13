@@ -43,6 +43,8 @@
 #define BACKBONE_RSSI_THRESHOLD     (-70)   // Min avg RSSI for backbone eligibility
 #define BACKBONE_RSSI_REJECT        (-80)   // Nodes below this are forced LEAF
 #define BACKBONE_MIN_DEGREE         3       // Minimum neighbors to be backbone-eligible
+#define BACKBONE_PROMOTE_MIN_DEGREE 2       // Promote LEAF->BACKBONE only if at least 2 neighbors
+#define BACKBONE_PROMOTE_RSSI       (-80)   // Promote floor RSSI, weaker links stay LEAF
 #define BACKBONE_EVAL_INTERVAL_MS   30000   // Re-evaluate every 30s
 #define BACKBONE_INITIAL_DELAY_MS   15000   // Wait 15s after start before first eval
 #define BACKBONE_PDR_REJECT         50      // PDR < 50% → unreliable → force LEAF (0-100 scale)
@@ -565,7 +567,7 @@ static void dsdv_send_update(struct k_work *work)
     uint8_t original_ttl = g_chat_cli_instance->model->pub->ttl;
     g_chat_cli_instance->model->pub->ttl = dsdv_calc_ttl(MSG_UPDATE, BT_MESH_ADDR_ALL_NODES);
 
-    (void)bt_mesh_model_publish(gx_chat_cli_instance->model);
+    (void)bt_mesh_model_publish(g_chat_cli_instance->model);
 
     g_chat_cli_instance->model->pub->ttl = original_ttl;
     last_update_sent_time = k_uptime_get_32();  // Ghi nhận thời điểm gửi UPDATE
@@ -1106,20 +1108,21 @@ static void backbone_evaluate(void)
         }
     }
 
-    if (i_am_highest && g_my_degree >= BACKBONE_MIN_DEGREE && 
-        my_avg_rssi >= BACKBONE_RSSI_THRESHOLD) {
+    if (i_am_highest &&
+        g_my_degree >= BACKBONE_MIN_DEGREE &&
+        my_avg_rssi >= BACKBONE_RSSI_THRESHOLD &&
+        my_avg_pdr >= BACKBONE_PDR_REJECT) {
         g_my_role = NODE_ROLE_BACKBONE;
     } else {
+        /* Not selected as strongest local candidate -> default LEAF */
         g_my_role = NODE_ROLE_LEAF;
     }
 
-    /* --- Step 5: Connectivity check --- 
-     * If no backbone neighbor exists for this node, and this node has the
-     * highest score in its cluster, force it to BACKBONE for connectivity.
+    /* --- Step 5: Connectivity check ---
+     * If no backbone neighbor exists, promote only when minimum quality holds.
      */
     if (g_my_role == NODE_ROLE_LEAF) {
         bool has_backbone_neighbor = false;
-        bool i_have_highest_score_in_cluster = true;
 
         for (int i = 0; i < MAX_RSSI_NEIGHBORS; i++) {
             if (neighbor_backbone_info[i].addr == 0) continue;
@@ -1129,32 +1132,15 @@ static void backbone_evaluate(void)
                 has_backbone_neighbor = true;
                 break;
             }
-
-            /* Also check if any neighbor has a higher score */
-            uint8_t ns_pdr = 100;
-            {
-                uint32_t w = now - neighbor_backbone_info[i].pdr_window_start;
-                if (w > 5000) {
-                    uint16_t exp = (uint16_t)(w / BACKBONE_EXPECTED_HELLO_MS);
-                    if (exp == 0) exp = 1;
-                    ns_pdr = (uint8_t)((neighbor_backbone_info[i].hello_rx_count * 100) / exp);
-                    if (ns_pdr > 100) ns_pdr = 100;
-                }
-            }
-            uint16_t ns = calc_backbone_score_for(
-                neighbor_backbone_info[i].degree,
-                neighbor_backbone_info[i].avg_rssi,
-                ns_pdr
-            );
-            if (ns > my_score || (ns == my_score && neighbor_backbone_info[i].addr < my_addr)) {
-                i_have_highest_score_in_cluster = false;
-            }
         }
 
-        if (!has_backbone_neighbor && i_have_highest_score_in_cluster && g_my_degree >= 1) {
-            /* Isolated cluster: force highest-scoring node to BACKBONE */
+        if (!has_backbone_neighbor &&
+            g_my_degree >= BACKBONE_PROMOTE_MIN_DEGREE &&
+            my_avg_rssi >= BACKBONE_PROMOTE_RSSI &&
+            my_avg_pdr >= BACKBONE_PDR_REJECT) {
+            /* Isolated cluster: promote with explicit quality floors */
             g_my_role = NODE_ROLE_BACKBONE;
-            LOG_INF("BACKBONE: Forced BACKBONE (no backbone neighbor, highest in cluster)");
+            LOG_INF("BACKBONE: Forced BACKBONE (isolated, promote thresholds met)");
         }
     }
 
