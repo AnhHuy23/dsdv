@@ -15,9 +15,7 @@
 #include <stdlib.h>
 #include <zephyr/logging/log.h>
 
-// Extern DSDV routing table from chat_cli.c
-extern struct dsdv_route_entry g_dsdv_routes[];
-#define DSDV_ROUTE_TABLE_SIZE 64
+#include "dsdv_routing.h"
 LOG_MODULE_DECLARE(chat);
 
 static const struct shell *chat_shell;

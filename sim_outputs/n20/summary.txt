@@ -1,0 +1,16 @@
+nodes: 20
+duration_s: 120.0
+dt_s: 1.0
+pdr_pct: 98.80
+avg_latency_s: 2.445946
+avg_hops: 1.293
+hello_packets: 161
+update_packets: 143
+data_packets: 166
+data_delivered: 164
+data_dropped: 31
+route_changes: 541
+acks_delivered: 148
+backbone_nodes: 8
+leaf_nodes: 12
+remaining_energy_mean: 69.868

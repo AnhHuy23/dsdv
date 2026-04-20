@@ -147,6 +147,8 @@ struct dsdv_hello {
     uint32_t seq_num;   /**< Source's sequence number (even numbers only) */
     uint8_t  my_degree; /**< Number of active neighbors (for backbone election) */
     uint8_t  my_role;   /**< Current node role: NODE_ROLE_UNKNOWN/BACKBONE/LEAF */
+    uint8_t  my_leaf_type;      /**< 0=none/backbone, 1=leaf with backbone neighbor, 2=leaf gradient-only */
+    uint8_t  my_gradient_level; /**< 0 for type-1 leaf, >0 for gradient leaf, 0xFF unknown */
 } __packed;
 
 /**

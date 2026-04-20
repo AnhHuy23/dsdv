@@ -107,6 +107,7 @@ def plot_topology_png(
     adjacency: Mapping[int, Sequence[int]],
     gateway_id: int,
     roles: Optional[Sequence[int]],
+    gradient_leaf_nodes: Optional[Sequence[int]],
     out_path: Path,
     title: str = "WSN topology",
 ) -> Optional[Path]:
@@ -126,10 +127,16 @@ def plot_topology_png(
 
     xs = [pos[0] for pos in positions]
     ys = [pos[1] for pos in positions]
+    gradient_leaf_set = set(gradient_leaf_nodes or [])
     if roles is None:
         node_colors = ["#1f77b4" for _ in positions]
     else:
-        node_colors = [_role_color(role) for role in roles]
+        node_colors = []
+        for idx, role in enumerate(roles):
+            if idx in gradient_leaf_set:
+                node_colors.append("#ff7f0e")
+            else:
+                node_colors.append(_role_color(role))
     ax.scatter(xs, ys, s=56, c=node_colors, edgecolors="white", linewidths=0.7, zorder=3)
     ax.scatter([positions[gateway_id][0]], [positions[gateway_id][1]], s=140, c="#d62728",
                marker="*", edgecolors="white", linewidths=1.0, zorder=4, label="Gateway")
@@ -485,6 +492,9 @@ class Node:
     pending_ack_seq: Optional[int] = None
     pending_ack_deadline: float = 0.0
     attached_backbone: Optional[int] = None
+    gradient_level: Optional[int] = None
+    gradient_next_hop: Optional[int] = None
+    gradient_anchor_leaf: Optional[int] = None
 
 
 class DsdvEnvSim:
@@ -658,6 +668,17 @@ class DsdvEnvSim:
                 continue
             candidates.append((peer.addr, link_rssi, int(peer.degree), int(peer.hello_rx_count)))
 
+        # Fallback: if HELLO peer cache is stale/missing, still allow direct adjacent backbone neighbors.
+        for nb in sorted(self.adjacency[node.node_id]):
+            if self.nodes[nb].role != ROLE_BACKBONE:
+                continue
+            if any(existing[0] == nb for existing in candidates):
+                continue
+            link_rssi = float(node.neighbor_rssi.get(nb, self._link_rssi(node.node_id, nb)))
+            if link_rssi < BACKBONE_RSSI_REJECT:
+                continue
+            candidates.append((nb, link_rssi, len(self.adjacency[nb]), 0))
+
         if not candidates:
             return None
 
@@ -678,6 +699,9 @@ class DsdvEnvSim:
             return
 
         parent = node.attached_backbone
+        if parent is not None and (parent < 0 or parent >= self.node_count or self.nodes[parent].role != ROLE_BACKBONE):
+            node.attached_backbone = None
+            parent = None
         drop_dests: List[int] = []
         for dest, entry in node.routes.items():
             if dest == node.node_id:
@@ -701,6 +725,104 @@ class DsdvEnvSim:
                 node.routes[parent] = RouteEntry(parent, parent, 1, seq_num, self.time, True)
                 node.route_changed = True
                 self.counters["route_changes"] += 1
+
+    def _is_valid_leaf_parent(self, node: Node, parent: Optional[int]) -> bool:
+        if parent is None:
+            return False
+        if not (0 <= parent < self.node_count):
+            return False
+        if self.nodes[parent].role != ROLE_BACKBONE:
+            return False
+        if parent not in self.adjacency[node.node_id]:
+            return False
+        return True
+
+    def _has_backbone_neighbor(self, node: Node) -> bool:
+        for nb in self.adjacency[node.node_id]:
+            if self.nodes[nb].role == ROLE_BACKBONE:
+                return True
+        return False
+
+    def _recompute_leaf_gradients(self) -> None:
+        queue: Deque[int] = deque()
+        for node in self.nodes:
+            node.gradient_level = None
+            node.gradient_next_hop = None
+            node.gradient_anchor_leaf = None
+
+        for node in self.nodes:
+            if node.role != ROLE_LEAF:
+                continue
+            # Type-1 leaf: has direct backbone neighbor (no gradient forwarding).
+            if not self._has_backbone_neighbor(node):
+                continue
+            node.gradient_level = 0
+            node.gradient_anchor_leaf = node.node_id
+            queue.append(node.node_id)
+
+        while queue:
+            cur_id = queue.popleft()
+            cur = self.nodes[cur_id]
+            cur_level = int(cur.gradient_level) if cur.gradient_level is not None else 0
+            anchor = cur.gradient_anchor_leaf
+            for nb in self.adjacency[cur_id]:
+                peer = self.nodes[nb]
+                if peer.role != ROLE_LEAF:
+                    continue
+                if self._has_backbone_neighbor(peer):
+                    if peer.gradient_level is None:
+                        peer.gradient_level = 0
+                        peer.gradient_anchor_leaf = peer.node_id
+                    continue
+                if peer.gradient_level is not None and peer.gradient_level <= cur_level + 1:
+                    continue
+                peer.gradient_level = cur_level + 1
+                peer.gradient_next_hop = cur_id
+                peer.gradient_anchor_leaf = anchor
+                queue.append(nb)
+
+    def _refresh_leaf_parents(self) -> None:
+        for node in self.nodes:
+            if node.role != ROLE_LEAF:
+                node.attached_backbone = None
+                continue
+            prev_parent = node.attached_backbone
+            node.attached_backbone = self._select_leaf_backbone(node) if self._has_backbone_neighbor(node) else None
+            if prev_parent != node.attached_backbone:
+                node.my_info_changed = True
+
+    def _gradient_next_hop(self, node: Node) -> Optional[int]:
+        if node.role != ROLE_LEAF:
+            return None
+        if self._has_backbone_neighbor(node):
+            return None
+        next_hop = node.gradient_next_hop
+        if next_hop is None:
+            return None
+        if next_hop not in self.adjacency[node.node_id]:
+            return None
+        me_level = node.gradient_level
+        peer_level = self.nodes[next_hop].gradient_level
+        if me_level is None or peer_level is None:
+            return None
+        if peer_level >= me_level:
+            return None
+        return next_hop
+
+    def _next_hop_for_dest(self, node: Node, dest: int) -> Optional[int]:
+        if dest in self.adjacency[node.node_id]:
+            return dest
+        route = self._nearest_route(node, dest)
+        if route is not None:
+            return route.next_hop
+        if node.role == ROLE_LEAF:
+            grad_hop = self._gradient_next_hop(node)
+            if grad_hop is not None:
+                return grad_hop
+            parent = node.attached_backbone
+            if self._is_valid_leaf_parent(node, parent):
+                return parent
+        return None
 
     def _update_backbone_peer(self, node: Node, neighbor_id: int, degree: int, role: int, avg_rssi: float) -> None:
         info = node.backbone_peers.get(neighbor_id)
@@ -1062,12 +1184,12 @@ class DsdvEnvSim:
         return False
 
     def _forward_data(self, node: Node, packet: Dict[str, Any]) -> bool:
-        if self.backbone_forward_only and node.role != ROLE_BACKBONE:
+        strict_path = packet.get("strict_path")
+        if self.backbone_forward_only and node.role != ROLE_BACKBONE and not (isinstance(strict_path, list) and strict_path):
             self._queue_data_retry(node, packet)
             return False
 
         next_hop: Optional[int] = None
-        strict_path = packet.get("strict_path")
         if isinstance(strict_path, list) and strict_path:
             idx = int(packet.get("strict_idx", 0))
             if idx < len(strict_path) and strict_path[idx] == node.node_id and idx + 1 < len(strict_path):
@@ -1075,11 +1197,10 @@ class DsdvEnvSim:
                 packet["strict_idx"] = idx + 1
 
         if next_hop is None:
-            route = self._nearest_route(node, int(packet["dest"]))
-            if route is None:
+            next_hop = self._next_hop_for_dest(node, int(packet["dest"]))
+            if next_hop is None:
                 self._queue_data_retry(node, packet)
                 return False
-            next_hop = route.next_hop
 
         if next_hop not in self.adjacency[node.node_id]:
             self._queue_data_retry(node, packet)
@@ -1122,25 +1243,8 @@ class DsdvEnvSim:
         node.pending_data = keep
 
     def _path_to_gateway_exists(self, src_node: Node, max_depth: int = 16) -> bool:
-        if src_node.node_id == self.gateway_id:
-            return True
-        cur = src_node.node_id
-        visited = {cur}
-        depth = 0
-        while depth < max_depth and cur != self.gateway_id:
-            node = self.nodes[cur]
-            route = self._nearest_route(node, self.gateway_id)
-            if route is None:
-                return False
-            nxt = route.next_hop
-            if nxt not in self.adjacency[cur]:
-                return False
-            if nxt in visited:
-                return False
-            visited.add(nxt)
-            cur = nxt
-            depth += 1
-        return cur == self.gateway_id
+        path = self._resolve_path(src_node.node_id, self.gateway_id, max_depth=max_depth)
+        return bool(path and path[-1] == self.gateway_id)
 
     def _rank_sink_candidate(self, node: Node) -> Tuple[int, int, int, int]:
         role_rank = 0 if node.node_id == self.gateway_id else 1 if node.role == ROLE_BACKBONE else 2
@@ -1198,10 +1302,9 @@ class DsdvEnvSim:
         depth = 0
         while depth < max_depth and cur != dest_id:
             node = self.nodes[cur]
-            route = self._nearest_route(node, dest_id)
-            if route is None:
+            nxt = self._next_hop_for_dest(node, dest_id)
+            if nxt is None:
                 return None
-            nxt = route.next_hop
             if nxt not in self.adjacency[cur]:
                 return None
             if nxt in visited:
@@ -1285,13 +1388,13 @@ class DsdvEnvSim:
             self.counters["control_dropped"] += 1
             return
 
-        route = self._nearest_route(node, original_src)
-        if route is None:
+        next_hop = self._next_hop_for_dest(node, original_src)
+        if next_hop is None:
             self.counters["control_dropped"] += 1
             return
 
         ack_payload = dict(msg.payload)
-        self._unicast(node.node_id, route.next_hop, "ACK", ack_payload, ttl=min(INF_HOPS, route.hop_count + 1))
+        self._unicast(node.node_id, next_hop, "ACK", ack_payload, ttl=min(INF_HOPS, 10))
 
     def _handle_data(self, node: Node, msg: Message) -> None:
         packet = dict(msg.payload)
@@ -1305,9 +1408,9 @@ class DsdvEnvSim:
                     "created_at": float(packet["created_at"]),
                     "seq_num": int(packet["seq_num"]),
                 }
-                route = self._nearest_route(node, int(packet["src"]))
-                if route is not None:
-                    self._unicast(node.node_id, route.next_hop, "ACK", ack_payload, ttl=min(INF_HOPS, route.hop_count + 1))
+                next_hop = self._next_hop_for_dest(node, int(packet["src"]))
+                if next_hop is not None:
+                    self._unicast(node.node_id, next_hop, "ACK", ack_payload, ttl=min(INF_HOPS, 10))
             return
         # For strict-path forwarding in ideal-room mode, allow retransmitted copies.
         if "strict_path" not in packet:
@@ -1348,19 +1451,16 @@ class DsdvEnvSim:
         if self.data_period <= 0 or self.time < self.next_global_data:
             return
 
-        def _stable_route(node: Node) -> Optional[RouteEntry]:
-            route = self._nearest_route(node, self.gateway_id)
-            if route is None:
+        def _stable_hop_count(node: Node) -> Optional[int]:
+            path = self._resolve_path(node.node_id, self.gateway_id, max_depth=24)
+            if not path or len(path) < 2:
                 return None
-            if route.seq_num % 2 == 1:
+            hop_count = len(path) - 1
+            if hop_count > 6:
                 return None
-            if (self.time - route.last_update) > 30.0:
-                return None
-            if route.hop_count > 6:
-                return None
-            return route
+            return hop_count
 
-        candidate_routes: Dict[int, RouteEntry] = {}
+        candidate_hops: Dict[int, int] = {}
         for node in self.nodes:
             if node.node_id == self.gateway_id or node.energy <= 0.0:
                 continue
@@ -1372,22 +1472,18 @@ class DsdvEnvSim:
                     node.pending_ack_deadline = 0.0
                 else:
                     continue
-            route = _stable_route(node)
-            if route is None:
+            hop_count = _stable_hop_count(node)
+            if hop_count is None:
                 continue
             if not self._path_to_gateway_exists(node):
                 continue
-            if HIGH_RELIABILITY_TRAFFIC and route.hop_count > 3:
+            if HIGH_RELIABILITY_TRAFFIC and hop_count > 3:
                 continue
-            if HIGH_RELIABILITY_TRAFFIC and route.hop_count > TRAFFIC_MAX_HOPS:
+            if HIGH_RELIABILITY_TRAFFIC and hop_count > TRAFFIC_MAX_HOPS:
                 continue
-            if HIGH_RELIABILITY_TRAFFIC:
-                nh = self.nodes[route.next_hop]
-                if nh.role != ROLE_BACKBONE and route.hop_count > 1:
-                    continue
-            candidate_routes[node.node_id] = route
+            candidate_hops[node.node_id] = hop_count
 
-        candidates = [self.nodes[node_id] for node_id in candidate_routes]
+        candidates = [self.nodes[node_id] for node_id in candidate_hops]
         if not candidates:
             self.next_global_data = self.time + self.data_period + self.rng.uniform(0.0, self.data_period * 0.4)
             return
@@ -1398,7 +1494,7 @@ class DsdvEnvSim:
             candidates = sorted(
                 candidates,
                 key=lambda n: (
-                    candidate_routes[n.node_id].hop_count,
+                    candidate_hops[n.node_id],
                     0 if n.role == ROLE_BACKBONE else 1,
                     n.node_id,
                 ),
@@ -1409,8 +1505,7 @@ class DsdvEnvSim:
         self.rng.shuffle(send_pool)
         sends = min(TRAFFIC_BURST_SIZE, len(send_pool))
         for src_node in send_pool[:sends]:
-            route = candidate_routes.get(src_node.node_id)
-            if route is None:
+            if src_node.node_id not in candidate_hops:
                 self.counters["data_dropped"] += 1
                 src_node.dropped_count += 1
                 continue
@@ -1572,8 +1667,11 @@ class DsdvEnvSim:
             if self.time >= node.next_update:
                 self._send_update(node)
             self._process_pending_data(node)
+        self._refresh_leaf_parents()
         if backbone_eval_ran:
             self._enforce_backbone_connectivity()
+            self._refresh_leaf_parents()
+        self._recompute_leaf_gradients()
         self._schedule_global_data()
         self._collect_sample()
         self.time += self.dt
@@ -1779,6 +1877,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sim.adjacency,
             sim.gateway_id,
             [node.role for node in sim.nodes],
+            [
+                node.node_id
+                for node in sim.nodes
+                if node.role == ROLE_LEAF and node.gradient_next_hop is not None
+            ],
             run_dir / "topology.png",
             title=sim._topology_frame_title(),
         )

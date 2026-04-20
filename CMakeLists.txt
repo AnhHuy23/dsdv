@@ -12,6 +12,12 @@ project(chat_2)
 target_sources(app PRIVATE
 	src/main.c
 	src/model_handler.c
-	src/chat_cli.c)
+	src/chat_cli.c
+	src/chat_cli_state.c
+	src/chat_cli_neighbor.c
+	src/chat_cli_backbone.c
+	src/chat_cli_mesh.c
+	src/dsdv_routing.c
+	src/gradient_routing.c)
 target_include_directories(app PRIVATE include)
 # NORDIC SDK APP END
