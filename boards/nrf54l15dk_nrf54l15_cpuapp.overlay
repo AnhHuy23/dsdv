@@ -7,6 +7,15 @@
 	zephyr,user {
 		io-channels = <&adc 0>;
 	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		memory: memory@20000000 {
+			reg = <0x20000000 0x2f000>;
+		};
+	};
 };
 
 &adc {
@@ -25,3 +34,7 @@
 };
 
 
+
+&cpuapp_nvic {
+	status = "disabled";
+};

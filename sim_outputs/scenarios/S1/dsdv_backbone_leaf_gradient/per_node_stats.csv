@@ -1,0 +1,11 @@
+node_id,role,tx_count,rx_count,hello_tx_count,dropped_count,degree
+0,backbone,131,230,9,0,0
+1,leaf,135,160,21,18,2
+2,leaf,138,211,15,0,3
+3,leaf,61,112,20,17,3
+4,leaf,47,115,20,16,3
+5,leaf,111,193,20,9,3
+6,leaf,142,202,18,0,3
+7,leaf,62,143,20,9,3
+8,leaf,120,99,20,31,1
+9,leaf,131,211,20,17,3

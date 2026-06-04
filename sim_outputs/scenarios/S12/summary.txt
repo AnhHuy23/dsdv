@@ -1,0 +1,17 @@
+sim_profile: full
+nodes: 100
+duration_s: 1.0
+dt_s: 1.0
+pdr_pct: 0.00
+avg_latency_s: 0.000000
+avg_hops: 0.000
+hello_packets: 0
+update_packets: 0
+data_packets: 0
+data_delivered: 0
+data_dropped: 0
+route_changes: 0
+acks_delivered: 0
+backbone_nodes: 0
+leaf_nodes: 0
+remaining_energy_mean: 100.000

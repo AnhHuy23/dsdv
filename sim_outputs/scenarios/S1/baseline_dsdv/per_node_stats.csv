@@ -1,0 +1,11 @@
+node_id,role,tx_count,rx_count,hello_tx_count,dropped_count,degree
+0,backbone,136,216,10,0,5
+1,backbone,134,171,20,6,2
+2,backbone,139,210,15,0,4
+3,backbone,142,202,19,0,3
+4,backbone,140,197,21,7,2
+5,backbone,138,211,13,1,4
+6,backbone,143,200,16,0,3
+7,backbone,137,215,20,3,2
+8,backbone,89,64,20,15,1
+9,backbone,138,211,18,7,3

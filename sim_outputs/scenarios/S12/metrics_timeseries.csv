@@ -1,0 +1,2 @@
+t,pdr,avg_latency_s,avg_hops,hello_packets,update_packets,route_changes,data_packets,data_delivered,data_dropped
+0.0,0.0,0.0,0.0,0,0,0,0,0,0

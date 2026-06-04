@@ -1,0 +1,13 @@
+scenario_id,description_vi,baseline_pdr,backbone_leaf_pdr,full_pdr
+S1,"10 node, uniform, tải thấp, liên kết tốt",93.37,91.67,85.12
+S2,"10 node, uniform, tải trung bình, liên kết tốt",88.11,91.27,75.53
+S3,"10 node, clustered, tải cao, liên kết trung bình",82.36,81.05,71.25
+S4,"30 node, uniform, tải thấp, liên kết tốt",46.53,98.23,86.48
+S5,"30 node, uniform, tải cao, liên kết trung bình",44.93,94.43,86.94
+S6,"30 node, clustered, tải cao, liên kết trung bình",64.92,94.59,92.98
+S7,"50 node, uniform, tải trung bình, liên kết trung bình",47.55,95.81,95.81
+S8,"50 node, clustered, tải cao, liên kết trung bình",68.49,99.54,96.89
+S9,"50 node, uniform, tải trung bình, liên kết yếu",40.51,97.85,97.75
+S10,"50 node, clustered, tải cao, liên kết yếu",63.63,92.05,89.11
+S11,"100 node, uniform, tải cao, liên kết trung bình",50.62,100.0,100.0
+S12,"100 node, clustered, tải cao, liên kết yếu (cụm dày, vùng nhỏ hơn S10)",83.48,97.22,94.49

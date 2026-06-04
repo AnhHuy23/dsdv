@@ -6,9 +6,14 @@ loop (`dt`) rather than an event-driven simulator such as simpy.
 Usage example:
 
     python dsdv_env_sim.py --nodes 30 --duration 300 --dt 1.0 --seed 7
+    python dsdv_env_sim.py --nodes 30 --placement uniform   # legacy spread; clustered pins gateway at hub
+    python dsdv_env_sim.py --compare-three --nodes 30       # Baseline / +Backbone-Leaf / +Gradient → subfolders + metrics_chart each
+    python dsdv_env_sim.py --list-scenarios                 # Print preset S1..S12 (Vietnamese labels)
+    python dsdv_env_sim.py --scenario S4                    # One preset → <out-dir>/scenarios/S4/ (override --scenarios-dir)
+    python dsdv_env_sim.py --all-scenarios                  # Run S1..S12 sequentially into separate folders
 
 Outputs are written under `<out-dir>/n{N}/` and may include CSV summaries,
-PNG plots, and an optional GIF/MP4 animation.
+PNG plots (``topology.png``, ``metrics_chart.png``, ``metrics_chart_bars.png``), and an optional GIF/MP4 animation.
 
 Dependencies:
     - matplotlib for plots/animation
@@ -19,9 +24,12 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import json
 import math
 import random
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,9 +60,12 @@ DEFAULT_ENERGY_PER_RX = 0.18
 DEFAULT_FPS = 6
 DEFAULT_VIDEO_STRIDE = 1
 DEFAULT_VIDEO_MAX_FRAMES = 2000
+DEFAULT_NODE_PLACEMENT = "clustered"
+DEFAULT_CLUSTER_STD_FRAC = 0.22
 HELLO_KEEPALIVE_PERIODS = 16
 ROUTE_SETTLE_TIME_S = 45.0
 UPDATE_MIN_INTERVAL_S = 3.0
+LEAF_UPDATE_SUPPRESS_BACKOFF = 4.0
 NEIGHBOR_RSSI_VALID_WINDOW_S = 90.0
 HELLO_RSSI_MARGIN_NEW = 1.0
 HELLO_RSSI_MARGIN_EXISTING = 4.0
@@ -84,6 +95,225 @@ TRAFFIC_SINK_POOL = 4
 TRAFFIC_MAX_HOPS = 3
 TRAFFIC_BURST_SIZE = 4
 
+# (internal profile key, output subdirectory under n<N>/)
+SIM_PROFILE_SEQUENCE: Tuple[Tuple[str, str], ...] = (
+    ("baseline", "baseline_dsdv"),
+    ("backbone_leaf", "dsdv_backbone_leaf"),
+    ("full", "dsdv_backbone_leaf_gradient"),
+)
+SIM_PROFILE_LABELS = {
+    "baseline": "Baseline DSDV",
+    "backbone_leaf": "DSDV + Backbone-Leaf",
+    "full": "DSDV + Backbone-Leaf + Gradient",
+}
+
+# Preset evaluation scenarios (thesis / benchmark S1..S12).
+# Keys match argparse attribute names. ``description_vi`` is metadata only (written to scenario_spec.json).
+# Load: larger ``data_period`` => lower traffic. Link quality: more negative ``rssi_threshold`` => larger
+# nominal hop range (``dmax``); higher ``noise_rssi_amp`` / ``path_loss_n`` => harsher channel.
+SCENARIO_ORDER: Tuple[str, ...] = (
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8",
+    "S9",
+    "S10",
+    "S11",
+    "S12",
+)
+
+SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
+    "S1": {
+        "description_vi": "10 node, uniform, tải thấp, liên kết tốt",
+        "nodes": 10,
+        "placement": "uniform",
+        "data_period": 1.35,
+        "rssi_threshold": -93.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.78,
+        "area_w": 18.0,
+        "area_h": 12.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 80,
+    },
+    "S2": {
+        "description_vi": "10 node, uniform, tải trung bình, liên kết tốt",
+        "nodes": 10,
+        "placement": "uniform",
+        "data_period": 0.38,
+        "rssi_threshold": -93.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.78,
+        "area_w": 18.0,
+        "area_h": 12.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 80,
+    },
+    "S3": {
+        "description_vi": "10 node, clustered, tải cao, liên kết trung bình",
+        "nodes": 10,
+        "placement": "clustered",
+        "data_period": 0.12,
+        "rssi_threshold": -84.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.9,
+        "area_w": 18.0,
+        "area_h": 12.0,
+        "cluster_std_frac": 0.2,
+        "max_attempts": 80,
+    },
+    "S4": {
+        "description_vi": "30 node, uniform, tải thấp, liên kết tốt",
+        "nodes": 30,
+        "placement": "uniform",
+        "data_period": 1.35,
+        "rssi_threshold": -93.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.78,
+        "area_w": 18.0,
+        "area_h": 12.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 80,
+    },
+    "S5": {
+        "description_vi": "30 node, uniform, tải cao, liên kết trung bình",
+        "nodes": 30,
+        "placement": "uniform",
+        "data_period": 0.12,
+        "rssi_threshold": -84.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.9,
+        "area_w": 18.0,
+        "area_h": 12.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 80,
+    },
+    "S6": {
+        "description_vi": "30 node, clustered, tải cao, liên kết trung bình",
+        "nodes": 30,
+        "placement": "clustered",
+        "data_period": 0.12,
+        "rssi_threshold": -84.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.9,
+        "area_w": 18.0,
+        "area_h": 12.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 80,
+    },
+    "S7": {
+        "description_vi": "50 node, uniform, tải trung bình, liên kết trung bình",
+        "nodes": 50,
+        "placement": "uniform",
+        "data_period": 0.38,
+        "rssi_threshold": -84.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.9,
+        "area_w": 22.0,
+        "area_h": 15.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 100,
+        "max_degree": 10,
+        "extra_edge_factor": 0.95,
+    },
+    "S8": {
+        "description_vi": "50 node, clustered, tải cao, liên kết trung bình",
+        "nodes": 50,
+        "placement": "clustered",
+        "data_period": 0.12,
+        "rssi_threshold": -84.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.9,
+        "area_w": 22.0,
+        "area_h": 15.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 100,
+        "max_degree": 10,
+        "extra_edge_factor": 0.95,
+    },
+    "S9": {
+        "description_vi": "50 node, uniform, tải trung bình, liên kết yếu",
+        "nodes": 50,
+        "placement": "uniform",
+        "data_period": 0.38,
+        "rssi_threshold": -79.0,
+        "noise_rssi_amp": 1.8,
+        "path_loss_n": 2.05,
+        "area_w": 22.0,
+        "area_h": 15.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 120,
+        "max_degree": 11,
+        "extra_edge_factor": 1.0,
+    },
+    "S10": {
+        "description_vi": "50 node, clustered, tải cao, liên kết yếu",
+        "nodes": 50,
+        "placement": "clustered",
+        "data_period": 0.12,
+        "rssi_threshold": -79.0,
+        "noise_rssi_amp": 2.0,
+        "path_loss_n": 2.08,
+        "area_w": 22.0,
+        "area_h": 15.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 120,
+        "max_degree": 11,
+        "extra_edge_factor": 1.0,
+    },
+    "S11": {
+        "description_vi": "100 node, uniform, tải cao, liên kết trung bình",
+        "nodes": 100,
+        "placement": "uniform",
+        "data_period": 0.12,
+        "rssi_threshold": -84.0,
+        "noise_rssi_amp": 0.0,
+        "path_loss_n": 1.9,
+        "area_w": 32.0,
+        "area_h": 22.0,
+        "cluster_std_frac": 0.22,
+        "max_attempts": 120,
+        "max_degree": 12,
+        "extra_edge_factor": 1.0,
+    },
+    "S12": {
+        "description_vi": "100 node, clustered, tải cao, liên kết yếu (cụm dày, vùng nhỏ hơn S10)",
+        "nodes": 100,
+        "placement": "clustered",
+        "data_period": 0.12,
+        "rssi_threshold": -78.5,
+        "noise_rssi_amp": 2.4,
+        "path_loss_n": 2.12,
+        "area_w": 24.0,
+        "area_h": 16.0,
+        "cluster_std_frac": 0.16,
+        "max_attempts": 180,
+        "max_degree": 12,
+        "extra_edge_factor": 1.05,
+    },
+}
+
+
+def _apply_scenario_to_args(base: argparse.Namespace, scenario_id: str) -> argparse.Namespace:
+    """Return a copy of ``base`` with preset fields for ``scenario_id`` (sets ``scenario_id`` / description)."""
+    if scenario_id not in SCENARIO_PRESETS:
+        raise ValueError(f"unknown scenario {scenario_id!r}; expected one of {SCENARIO_ORDER}")
+    preset = SCENARIO_PRESETS[scenario_id]
+    out = copy.deepcopy(base)
+    out.scenario_id = scenario_id
+    out.scenario_description_vi = str(preset.get("description_vi", ""))
+    for key, value in preset.items():
+        if key == "description_vi":
+            continue
+        setattr(out, key, value)
+    # Square ``--area`` would override ``area_w``/``area_h`` in :func:`_make_sim`; presets use explicit W×H.
+    out.area = None
+    return out
+
 
 def _lazy_import_matplotlib():
     try:
@@ -110,6 +340,7 @@ def plot_topology_png(
     gradient_leaf_nodes: Optional[Sequence[int]],
     out_path: Path,
     title: str = "WSN topology",
+    sim_profile: Optional[str] = None,
 ) -> Optional[Path]:
     plt, _, _, err = _lazy_import_matplotlib()
     if err is not None:
@@ -125,21 +356,54 @@ def plot_topology_png(
             x1, y1 = positions[dst]
             ax.plot([x0, x1], [y0, y1], color="#8aa0b8", linewidth=0.8, alpha=0.55)
 
-    xs = [pos[0] for pos in positions]
-    ys = [pos[1] for pos in positions]
     gradient_leaf_set = set(gradient_leaf_nodes or [])
-    if roles is None:
-        node_colors = ["#1f77b4" for _ in positions]
+    is_baseline = (sim_profile == "baseline")
+    if is_baseline:
+        # Baseline DSDV is a flat proactive routing protocol with no backbone/leaf hierarchy.
+        # Internally every node is marked ROLE_BACKBONE for relaying eligibility; show as a single node class instead.
+        groups: Dict[str, Dict[str, Any]] = {
+            "node": {"color": "#1f77b4", "label": "Node (Baseline DSDV)", "x": [], "y": []},
+        }
+        for idx, (x, y) in enumerate(positions):
+            if idx == gateway_id:
+                continue
+            groups["node"]["x"].append(x)
+            groups["node"]["y"].append(y)
     else:
-        node_colors = []
-        for idx, role in enumerate(roles):
+        groups = {
+            "backbone": {"color": "#d62728", "label": "Backbone", "x": [], "y": []},
+            "leaf_t1": {"color": "#1f77b4", "label": "Leaf (kề backbone)", "x": [], "y": []},
+            "leaf_grad": {"color": "#ff7f0e", "label": "Leaf qua Gradient", "x": [], "y": []},
+            "unknown": {"color": "#7f7f7f", "label": "Chưa phân loại", "x": [], "y": []},
+        }
+        for idx, (x, y) in enumerate(positions):
+            if idx == gateway_id:
+                continue
+            role = roles[idx] if roles is not None else ROLE_UNKNOWN
             if idx in gradient_leaf_set:
-                node_colors.append("#ff7f0e")
+                key = "leaf_grad"
+            elif role == ROLE_BACKBONE:
+                key = "backbone"
+            elif role == ROLE_LEAF:
+                key = "leaf_t1"
             else:
-                node_colors.append(_role_color(role))
-    ax.scatter(xs, ys, s=56, c=node_colors, edgecolors="white", linewidths=0.7, zorder=3)
-    ax.scatter([positions[gateway_id][0]], [positions[gateway_id][1]], s=140, c="#d62728",
-               marker="*", edgecolors="white", linewidths=1.0, zorder=4, label="Gateway")
+                key = "unknown"
+            groups[key]["x"].append(x)
+            groups[key]["y"].append(y)
+
+    for key, info in groups.items():
+        if not info["x"]:
+            continue
+        ax.scatter(
+            info["x"], info["y"],
+            s=64, c=info["color"], edgecolors="white", linewidths=0.7,
+            zorder=3, label=info["label"],
+        )
+
+    gw_x, gw_y = positions[gateway_id]
+    ax.scatter([gw_x], [gw_y], s=220, c="#ffd400", marker="*",
+               edgecolors="#8a2200", linewidths=1.2, zorder=4, label=f"Gateway (id={gateway_id})")
+
     for idx, (x, y) in enumerate(positions):
         ax.annotate(
             str(idx),
@@ -158,7 +422,7 @@ def plot_topology_png(
     ax.set_ylabel("Y (m)")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.2)
-    ax.legend(loc="best")
+    ax.legend(loc="best", fontsize=9, framealpha=0.92)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
@@ -213,6 +477,409 @@ def plot_metrics_chart(samples: Sequence[Mapping[str, Any]], out_path: Path, tit
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path)
     plt.close(fig)
+    return out_path
+
+
+def _bin_metrics_by_time(
+    samples: Sequence[Mapping[str, Any]],
+    n_bins: int,
+) -> Tuple[
+    List[float],
+    List[float],
+    List[float],
+    List[float],
+    List[float],
+    List[float],
+]:
+    """Aggregate samples into ``n_bins`` equal-width time buckets.
+
+    PDR, latency, and hops use the **mean** inside each bucket. HELLO and UPDATE
+    use the **last** value in the bucket (cumulative counters are monotone).
+    """
+    t = [float(row["t"]) for row in samples]
+    pdr = [float(row["pdr"]) for row in samples]
+    latency = [float(row["avg_latency_s"]) for row in samples]
+    hops = [float(row["avg_hops"]) for row in samples]
+    hello = [float(row["hello_packets"]) for row in samples]
+    update = [float(row["update_packets"]) for row in samples]
+    n = len(t)
+    n_bins = max(1, min(n_bins, n))
+    t0, t1 = t[0], t[-1]
+    span = max(t1 - t0, 1e-12)
+
+    buckets_pdr: List[List[float]] = [[] for _ in range(n_bins)]
+    buckets_lat: List[List[float]] = [[] for _ in range(n_bins)]
+    buckets_hops: List[List[float]] = [[] for _ in range(n_bins)]
+    buckets_hello: List[List[float]] = [[] for _ in range(n_bins)]
+    buckets_upd: List[List[float]] = [[] for _ in range(n_bins)]
+
+    for i in range(n):
+        ti = t[i]
+        b = int((ti - t0) / span * n_bins) if span > 0 else 0
+        if b >= n_bins:
+            b = n_bins - 1
+        buckets_pdr[b].append(pdr[i])
+        buckets_lat[b].append(latency[i])
+        buckets_hops[b].append(hops[i])
+        buckets_hello[b].append(hello[i])
+        buckets_upd[b].append(update[i])
+
+    def _mean(vals: List[float]) -> float:
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def _last(vals: List[float]) -> float:
+        return float(vals[-1]) if vals else 0.0
+
+    centers: List[float] = []
+    out_pdr: List[float] = []
+    out_lat: List[float] = []
+    out_hops: List[float] = []
+    out_hello: List[float] = []
+    out_update: List[float] = []
+    for b in range(n_bins):
+        lo = t0 + (b / n_bins) * span
+        hi = t0 + ((b + 1) / n_bins) * span
+        centers.append(0.5 * (lo + hi))
+        out_pdr.append(_mean(buckets_pdr[b]))
+        out_lat.append(_mean(buckets_lat[b]))
+        out_hops.append(_mean(buckets_hops[b]))
+        out_hello.append(_last(buckets_hello[b]))
+        out_update.append(_last(buckets_upd[b]))
+
+    return centers, out_pdr, out_lat, out_hops, out_hello, out_update
+
+
+def _sparse_time_xticks(tc: Sequence[float], max_labels: int = 12) -> Tuple[List[int], List[str]]:
+    """Pick bar indices and short time strings so x-axis stays readable."""
+    n = len(tc)
+    if n <= 0:
+        return [], []
+    if n <= max_labels:
+        ticks = list(range(n))
+    else:
+        # Evenly sample ~max_labels positions, always include first and last bar.
+        step = max(1, (n - 1) // (max_labels - 1))
+        ticks = list(range(0, n, step))
+        if ticks[-1] != n - 1:
+            ticks.append(n - 1)
+    span = float(tc[-1] - tc[0]) if n > 1 else 0.0
+    fmt = ".0f" if span > 90.0 else ".1f"
+    labels = [format(float(tc[i]), fmt) for i in ticks]
+    return ticks, labels
+
+
+def plot_metrics_bar_chart(
+    samples: Sequence[Mapping[str, Any]],
+    out_path: Path,
+    title: str = "Chỉ số mô phỏng (biểu đồ cột)",
+    max_bins: int = 56,
+) -> Optional[Path]:
+    """Same four panels as :func:`plot_metrics_chart`, using column (bar) charts.
+
+    Time axis is split into at most ``max_bins`` equal-width intervals; each bar
+    summarizes samples in that interval (mean for rates, end-of-interval value
+    for cumulative HELLO/UPDATE).
+    """
+    plt, _, _, err = _lazy_import_matplotlib()
+    if err is not None:
+        print(f"[WARN] matplotlib not available, skipping metrics bar chart: {err}")
+        return None
+
+    if not samples:
+        return None
+
+    n = len(samples)
+    n_bins = min(max_bins, max(1, n))
+    tc, pdr, latency, hops, hello, update = _bin_metrics_by_time(samples, n_bins)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.5), dpi=150)
+    x = list(range(len(tc)))
+    tick_idx, tick_lbl = _sparse_time_xticks(tc, max_labels=12)
+
+    def _style_time_xaxis(ax: Any) -> None:
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels(tick_lbl, rotation=30, ha="right", fontsize=9)
+        ax.set_xlabel("Thời gian mô phỏng (s)")
+        ax.margins(x=0.01)
+        ax.tick_params(axis="x", pad=2)
+
+    ax = axes[0, 0]
+    ax.bar(x, pdr, width=0.85, color="#2ca02c", edgecolor="#1a6b1a", linewidth=0.4, alpha=0.88)
+    ax.set_title("PDR (%)")
+    ax.set_ylabel("%")
+    _style_time_xaxis(ax)
+    ax.grid(True, axis="y", alpha=0.2)
+
+    ax = axes[0, 1]
+    ax.bar(x, latency, width=0.85, color="#9467bd", edgecolor="#5c3d7a", linewidth=0.4, alpha=0.88)
+    ax.set_title("Độ trễ trung bình (s)")
+    _style_time_xaxis(ax)
+    ax.grid(True, axis="y", alpha=0.2)
+
+    ax = axes[1, 0]
+    ax.bar(x, hops, width=0.85, color="#ff7f0e", edgecolor="#b35900", linewidth=0.4, alpha=0.88)
+    ax.set_title("Hop trung bình")
+    ax.set_ylabel("Số hop")
+    _style_time_xaxis(ax)
+    ax.grid(True, axis="y", alpha=0.2)
+
+    ax = axes[1, 1]
+    w = 0.38
+    x0 = [xi - w / 2 for xi in x]
+    x1 = [xi + w / 2 for xi in x]
+    ax.bar(x0, hello, width=w, label="HELLO (lũy kế)", color="#1f77b4", edgecolor="#0d4a73", linewidth=0.35, alpha=0.9)
+    ax.bar(x1, update, width=w, label="UPDATE (lũy kế)", color="#d62728", edgecolor="#8b1a1a", linewidth=0.35, alpha=0.9)
+    ax.set_title("HELLO và UPDATE (lũy kế)")
+    ax.set_ylabel("Gói tin (lũy kế)")
+    _style_time_xaxis(ax)
+    ax.legend(loc="best")
+    ax.grid(True, axis="y", alpha=0.2)
+
+    fig.suptitle(title)
+    fig.tight_layout(rect=[0.02, 0.11, 0.98, 0.94], h_pad=1.9, w_pad=1.15)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def plot_compare_control_overhead(summaries: Sequence[Mapping[str, Any]], out_path: Path) -> Optional[Path]:
+    """Grouped control-overhead bars for compare-three runs."""
+    if not summaries:
+        return None
+
+    labels = [SIM_PROFILE_LABELS.get(str(row.get("sim_profile", "")), str(row.get("sim_profile", ""))) for row in summaries]
+    hello = [float(row.get("hello_packets", 0.0)) for row in summaries]
+    update = [float(row.get("update_packets", 0.0)) for row in summaries]
+    total = [float(row.get("total_control_packets", 0.0)) for row in summaries]
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as err:  # pragma: no cover
+        print(f"[WARN] matplotlib not available, skipping control overhead chart: {err}")
+        return _plot_compare_control_overhead_pillow(labels, hello, update, total, out_path)
+
+    x = list(range(len(summaries)))
+    w = 0.26
+    fig, ax = plt.subplots(figsize=(10.5, 5.6), dpi=160)
+    bars_hello = ax.bar([i - w for i in x], hello, width=w, label="HELLO", color="#2f80ed", edgecolor="#1f5faa", linewidth=0.5)
+    bars_update = ax.bar(x, update, width=w, label="UPDATE", color="#d64545", edgecolor="#963030", linewidth=0.5)
+    bars_total = ax.bar([i + w for i in x], total, width=w, label="Total control", color="#333333", edgecolor="#111111", linewidth=0.5)
+
+    ax.set_title("Control overhead comparison")
+    ax.set_ylabel("Packets")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=10, ha="right")
+    ax.grid(True, axis="y", alpha=0.22)
+    ax.legend(loc="upper right", ncol=3, fontsize=8)
+    for bars in (bars_hello, bars_update, bars_total):
+        ax.bar_label(bars, fmt="%.0f", padding=2, fontsize=8)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_compare_control_overhead_pillow(
+    labels: Sequence[str],
+    hello: Sequence[float],
+    update: Sequence[float],
+    total: Sequence[float],
+    out_path: Path,
+) -> Optional[Path]:
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception as err:  # pragma: no cover
+        print(f"[WARN] pillow not available, skipping control overhead chart: {err}")
+        return None
+
+    width, height = 1280, 720
+    margin_l, margin_r, margin_t, margin_b = 110, 50, 80, 165
+    plot_w = width - margin_l - margin_r
+    plot_h = height - margin_t - margin_b
+    ymax = max([1.0, *hello, *update, *total])
+    step = max(100.0, math.ceil(ymax / 5.0 / 100.0) * 100.0)
+    ytop = math.ceil(ymax / step) * step
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+
+    def sx(group: int, offset: float) -> float:
+        group_w = plot_w / max(1, len(labels))
+        return margin_l + group_w * group + group_w * 0.5 + offset
+
+    def sy(value: float) -> float:
+        return margin_t + plot_h - (value / ytop) * plot_h
+
+    draw.text((margin_l, 30), "Control overhead comparison", fill="#111111", font=font)
+    draw.line((margin_l, margin_t, margin_l, margin_t + plot_h), fill="#222222", width=2)
+    draw.line((margin_l, margin_t + plot_h, margin_l + plot_w, margin_t + plot_h), fill="#222222", width=2)
+
+    tick = 0.0
+    while tick <= ytop + 1e-9:
+        y = sy(tick)
+        draw.line((margin_l, y, margin_l + plot_w, y), fill="#e3e3e3", width=1)
+        draw.text((25, y - 6), f"{int(tick)}", fill="#333333", font=font)
+        tick += step
+
+    series = (
+        ("HELLO", hello, "#2f80ed"),
+        ("UPDATE", update, "#d64545"),
+        ("Total control", total, "#333333"),
+    )
+    bar_w = min(70, plot_w / max(1, len(labels)) * 0.18)
+    offsets = (-bar_w * 1.15, 0.0, bar_w * 1.15)
+    for group_idx, label in enumerate(labels):
+        for (name, values, color), offset in zip(series, offsets):
+            value = float(values[group_idx])
+            x = sx(group_idx, offset)
+            y = sy(value)
+            draw.rectangle((x - bar_w / 2, y, x + bar_w / 2, margin_t + plot_h), fill=color)
+            draw.text((x - bar_w / 2, y - 18), f"{int(value)}", fill="#111111", font=font)
+        wrapped = label.replace(" + ", "\n+ ")
+        draw.multiline_text((sx(group_idx, 0.0) - 95, margin_t + plot_h + 20), wrapped, fill="#111111", font=font, align="center", spacing=4)
+
+    legend_x = margin_l + plot_w - 360
+    for i, (name, _values, color) in enumerate(series):
+        x = legend_x + i * 125
+        draw.rectangle((x, 48, x + 18, 66), fill=color)
+        draw.text((x + 24, 51), name, fill="#111111", font=font)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out_path)
+    return out_path
+
+
+def export_all_scenario_control_summary(rows: Sequence[Mapping[str, Any]], out_path: Path) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "scenario_id",
+        "sim_profile",
+        "hello_packets",
+        "update_packets",
+        "total_control_packets",
+        "pdr",
+        "avg_latency_s",
+        "avg_hops",
+        "route_changes",
+        "backbone_nodes",
+        "leaf_nodes",
+    ]
+    with out_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            summary = row.get("summary", {})
+            if not isinstance(summary, Mapping):
+                summary = {}
+            writer.writerow(
+                {
+                    "scenario_id": row.get("scenario_id", ""),
+                    "sim_profile": summary.get("sim_profile", row.get("sim_profile", "")),
+                    "hello_packets": summary.get("hello_packets", 0),
+                    "update_packets": summary.get("update_packets", 0),
+                    "total_control_packets": summary.get("total_control_packets", 0),
+                    "pdr": summary.get("pdr", 0.0),
+                    "avg_latency_s": summary.get("avg_latency_s", 0.0),
+                    "avg_hops": summary.get("avg_hops", 0.0),
+                    "route_changes": summary.get("route_changes", 0),
+                    "backbone_nodes": summary.get("backbone_nodes", 0),
+                    "leaf_nodes": summary.get("leaf_nodes", 0),
+                }
+            )
+    return out_path
+
+
+def plot_all_scenarios_control_metric(
+    rows: Sequence[Mapping[str, Any]],
+    out_path: Path,
+    metric: str,
+    title: str,
+    ylabel: str = "Packets",
+) -> Optional[Path]:
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception as err:  # pragma: no cover
+        print(f"[WARN] pillow not available, skipping all-scenario chart: {err}")
+        return None
+
+    scenario_ids = [sid for sid in SCENARIO_ORDER if any(row.get("scenario_id") == sid for row in rows)]
+    profiles = [key for key, _ in SIM_PROFILE_SEQUENCE]
+    values: Dict[Tuple[str, str], float] = {}
+    for row in rows:
+        sid = str(row.get("scenario_id", ""))
+        summary = row.get("summary", {})
+        if not isinstance(summary, Mapping):
+            continue
+        profile = str(summary.get("sim_profile", row.get("sim_profile", "")))
+        values[(sid, profile)] = float(summary.get(metric, 0.0))
+
+    if not scenario_ids:
+        return None
+
+    width, height = 1680, 820
+    margin_l, margin_r, margin_t, margin_b = 115, 50, 90, 130
+    plot_w = width - margin_l - margin_r
+    plot_h = height - margin_t - margin_b
+    ymax = max([1.0, *values.values()])
+    step = max(100.0, math.ceil(ymax / 5.0 / 100.0) * 100.0)
+    ytop = math.ceil(ymax / step) * step
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+
+    profile_labels = {
+        "baseline": "Baseline",
+        "backbone_leaf": "Backbone-Leaf",
+        "full": "Backbone-Leaf + Gradient",
+    }
+    colors = {
+        "baseline": "#2f80ed",
+        "backbone_leaf": "#d64545",
+        "full": "#333333",
+    }
+
+    def sy(value: float) -> float:
+        return margin_t + plot_h - (value / ytop) * plot_h
+
+    draw.text((margin_l, 34), title, fill="#111111", font=font)
+    draw.text((20, 38), ylabel, fill="#333333", font=font)
+    draw.line((margin_l, margin_t, margin_l, margin_t + plot_h), fill="#222222", width=2)
+    draw.line((margin_l, margin_t + plot_h, margin_l + plot_w, margin_t + plot_h), fill="#222222", width=2)
+
+    tick = 0.0
+    while tick <= ytop + 1e-9:
+        y = sy(tick)
+        draw.line((margin_l, y, margin_l + plot_w, y), fill="#e3e3e3", width=1)
+        draw.text((32, y - 6), f"{int(tick)}", fill="#333333", font=font)
+        tick += step
+
+    group_w = plot_w / len(scenario_ids)
+    bar_w = min(32.0, group_w * 0.2)
+    offsets = (-bar_w * 1.2, 0.0, bar_w * 1.2)
+    for idx, sid in enumerate(scenario_ids):
+        center = margin_l + group_w * idx + group_w * 0.5
+        for profile, offset in zip(profiles, offsets):
+            value = values.get((sid, profile), 0.0)
+            x = center + offset
+            y = sy(value)
+            draw.rectangle((x - bar_w / 2, y, x + bar_w / 2, margin_t + plot_h), fill=colors[profile])
+            if len(scenario_ids) <= 12:
+                draw.text((x - bar_w / 2, y - 15), f"{int(value)}", fill="#111111", font=font)
+        draw.text((center - 9, margin_t + plot_h + 18), sid, fill="#111111", font=font)
+
+    legend_x = margin_l + plot_w - 520
+    for i, profile in enumerate(profiles):
+        x = legend_x + i * 170
+        draw.rectangle((x, 58, x + 18, 76), fill=colors[profile])
+        draw.text((x + 24, 61), profile_labels[profile], fill="#111111", font=font)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out_path)
     return out_path
 
 
@@ -326,8 +993,47 @@ def _max_distance_from_rssi_threshold(rssi_1m: float, path_loss_n: float, rssi_t
     return 10.0 ** exponent
 
 
-def generate_positions(node_count: int, area_w: float, area_h: float, rng: random.Random) -> List[Tuple[float, float]]:
-    return [(rng.uniform(0.0, area_w), rng.uniform(0.0, area_h)) for _ in range(node_count)]
+def generate_positions(
+    node_count: int,
+    area_w: float,
+    area_h: float,
+    rng: random.Random,
+    *,
+    placement: str = DEFAULT_NODE_PLACEMENT,
+    cluster_std_frac: float = DEFAULT_CLUSTER_STD_FRAC,
+) -> Tuple[List[Tuple[float, float]], Optional[Tuple[float, float]]]:
+    """Place nodes in the deployment rectangle.
+
+    ``uniform``: independent uniform samples (legacy, spread across the area).
+    ``clustered``: 2D Gaussian cloud around one hub, clipped to the rectangle.
+    Returns ``(positions, hub)`` where ``hub`` is ``(cx, cy)`` for clustered mode
+    (caller should pin the gateway on/near this hub); ``hub`` is ``None`` for uniform.
+
+    The hub is kept away from edges by a few sigma so clipping does not scatter
+    many nodes along the border away from the dense core.
+    """
+    mode = (placement or DEFAULT_NODE_PLACEMENT).strip().lower()
+    if mode == "uniform":
+        return (
+            [(rng.uniform(0.0, area_w), rng.uniform(0.0, area_h)) for _ in range(node_count)],
+            None,
+        )
+    if mode != "clustered":
+        raise ValueError(f"unknown placement mode {placement!r}; use 'clustered' or 'uniform'")
+
+    span = min(float(area_w), float(area_h))
+    sigma = max(1e-6, float(cluster_std_frac) * span)
+    inset = min(3.0 * sigma, 0.45 * float(area_w), 0.45 * float(area_h))
+    cx = rng.uniform(inset, max(inset, area_w - inset))
+    cy = rng.uniform(inset, max(inset, area_h - inset))
+    out: List[Tuple[float, float]] = []
+    for _ in range(node_count):
+        x = cx + rng.gauss(0.0, sigma)
+        y = cy + rng.gauss(0.0, sigma)
+        x = max(0.0, min(area_w, x))
+        y = max(0.0, min(area_h, y))
+        out.append((x, y))
+    return out, (cx, cy)
 
 
 def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
@@ -409,14 +1115,34 @@ def generate_random_topology(
     rssi_threshold: float,
     noise_rssi_amp: float,
     seed: int,
+    placement: str = DEFAULT_NODE_PLACEMENT,
+    cluster_std_frac: float = DEFAULT_CLUSTER_STD_FRAC,
 ) -> Tuple[List[Tuple[float, float]], Dict[int, set[int]], float, int]:
     dmax = _max_distance_from_rssi_threshold(rssi_1m, path_loss_n, rssi_threshold, noise_rssi_amp)
     last_error: Optional[str] = None
     for attempt in range(max_attempts):
         rng = random.Random(seed + attempt * 9973)
-        positions = generate_positions(node_count, area_w, area_h, rng)
+        positions, cluster_hub = generate_positions(
+            node_count,
+            area_w,
+            area_h,
+            rng,
+            placement=placement,
+            cluster_std_frac=cluster_std_frac,
+        )
         root_id = gateway_id
-        if root_id < 0 or root_id >= node_count:
+        if cluster_hub is not None:
+            # Pin gateway at the cluster hub so the dense region surrounds the sink.
+            hub_x, hub_y = cluster_hub
+            if 0 <= gateway_id < node_count:
+                root_id = gateway_id
+            else:
+                root_id = min(range(node_count), key=lambda idx: _dist(positions[idx], cluster_hub))
+            jitter = max(0.02, 0.02 * min(area_w, area_h))
+            gx = max(0.0, min(area_w, hub_x + rng.uniform(-jitter, jitter)))
+            gy = max(0.0, min(area_h, hub_y + rng.uniform(-jitter, jitter)))
+            positions[root_id] = (gx, gy)
+        elif root_id < 0 or root_id >= node_count:
             center_x = area_w / 2.0
             center_y = area_h / 2.0
             root_id = min(range(node_count), key=lambda idx: _dist(positions[idx], (center_x, center_y)))
@@ -518,6 +1244,8 @@ class DsdvEnvSim:
         path_loss_n: float = DEFAULT_PATH_LOSS_N,
         rssi_threshold: float = DEFAULT_RSSI_THRESHOLD,
         noise_rssi_amp: float = DEFAULT_NOISE_RSSI_AMP,
+        node_placement: str = DEFAULT_NODE_PLACEMENT,
+        cluster_std_frac: float = DEFAULT_CLUSTER_STD_FRAC,
         hello: float = DEFAULT_HELLO_PERIOD,
         update: float = DEFAULT_UPDATE_PERIOD,
         timeout: float = DEFAULT_ROUTE_TIMEOUT,
@@ -534,6 +1262,7 @@ class DsdvEnvSim:
         video_stride: int = DEFAULT_VIDEO_STRIDE,
         video_max_frames: int = DEFAULT_VIDEO_MAX_FRAMES,
         backbone_forward_only: bool = BACKBONE_FORWARD_ONLY,
+        sim_profile: str = "full",
     ) -> None:
         self.node_count = int(nodes)
         self.duration = float(duration)
@@ -551,6 +1280,8 @@ class DsdvEnvSim:
         self.path_loss_n = float(path_loss_n)
         self.rssi_threshold = float(rssi_threshold)
         self.noise_rssi_amp = float(noise_rssi_amp)
+        self.node_placement = str(node_placement)
+        self.cluster_std_frac = float(cluster_std_frac)
         self.hello_period = float(hello)
         self.update_period = float(update)
         self.route_timeout = float(timeout)
@@ -566,7 +1297,15 @@ class DsdvEnvSim:
         self.fps = int(fps)
         self.video_stride = max(1, int(video_stride))
         self.video_max_frames = int(video_max_frames)
+        self.sim_profile = str(sim_profile)
+        if self.sim_profile not in ("baseline", "backbone_leaf", "full"):
+            raise ValueError("sim_profile must be 'baseline', 'backbone_leaf', or 'full'")
+        # Baseline DSDV: flat proactive DSDV (no role hierarchy, no gradient, any hop may relay data/ACK).
+        self.hierarchy_enabled = self.sim_profile != "baseline"
+        self.gradient_enabled = self.sim_profile == "full"
         self.backbone_forward_only = bool(backbone_forward_only)
+        if self.sim_profile == "baseline":
+            self.backbone_forward_only = False
         self.rng = random.Random(self.seed)
         self.positions, self.adjacency, self.dmax, self.gateway_id = generate_random_topology(
             self.node_count,
@@ -581,6 +1320,8 @@ class DsdvEnvSim:
             self.rssi_threshold,
             self.noise_rssi_amp,
             self.seed,
+            placement=self.node_placement,
+            cluster_std_frac=self.cluster_std_frac,
         )
         if not (0 <= self.focus_node < self.node_count):
             self.focus_node = self.gateway_id
@@ -595,6 +1336,14 @@ class DsdvEnvSim:
             node.next_data = self.data_start_delay + self._initial_schedule(self.data_period) if self.data_period > 0 else math.inf
             node.next_backbone_eval = BACKBONE_INITIAL_DELAY_S + self.rng.uniform(0.0, 5.0)
             self.nodes.append(node)
+
+        if self.sim_profile == "baseline":
+            for n in self.nodes:
+                n.role = ROLE_BACKBONE
+                n.attached_backbone = None
+                n.gradient_level = None
+                n.gradient_next_hop = None
+                n.gradient_anchor_leaf = None
 
         self.in_flight: Deque[Message] = deque()
         self.samples: List[Dict[str, Any]] = []
@@ -744,12 +1493,14 @@ class DsdvEnvSim:
         return False
 
     def _recompute_leaf_gradients(self) -> None:
-        queue: Deque[int] = deque()
         for node in self.nodes:
             node.gradient_level = None
             node.gradient_next_hop = None
             node.gradient_anchor_leaf = None
+        if not self.gradient_enabled:
+            return
 
+        queue: Deque[int] = deque()
         for node in self.nodes:
             if node.role != ROLE_LEAF:
                 continue
@@ -1131,6 +1882,17 @@ class DsdvEnvSim:
 
         if now - self._last_update_sent[node.node_id] < UPDATE_MIN_INTERVAL_S:
             node.next_update = self._last_update_sent[node.node_id] + UPDATE_MIN_INTERVAL_S + self.rng.uniform(0.0, 0.5)
+            return
+
+        if self.hierarchy_enabled and node.role == ROLE_LEAF and node.attached_backbone is not None:
+            # In Backbone-Leaf mode, the backbone owns proactive route advertisements.
+            # Attached leaves rely on HELLO for direct parent reachability and do not
+            # flood DSDV UPDATEs for routes that the backbone will advertise.
+            for entry in node.routes.values():
+                entry.changed = False
+            node.route_changed = False
+            node.my_info_changed = False
+            node.next_update = self.time + (self.update_period * LEAF_UPDATE_SUPPRESS_BACKOFF) + self.rng.uniform(0.0, self.update_period)
             return
 
         changed_entries = [entry for entry in node.routes.values() if entry.dest != node.node_id and entry.hop_count < INF_HOPS and entry.changed]
@@ -1658,7 +2420,7 @@ class DsdvEnvSim:
         backbone_eval_ran = False
         for node in self.nodes:
             self._expire_routes(node)
-            if self.time >= node.next_backbone_eval:
+            if self.hierarchy_enabled and self.time >= node.next_backbone_eval:
                 self._evaluate_backbone(node)
                 node.next_backbone_eval = self.time + BACKBONE_EVAL_INTERVAL_S + self.rng.uniform(0.0, 5.0)
                 backbone_eval_ran = True
@@ -1668,7 +2430,7 @@ class DsdvEnvSim:
                 self._send_update(node)
             self._process_pending_data(node)
         self._refresh_leaf_parents()
-        if backbone_eval_ran:
+        if self.hierarchy_enabled and backbone_eval_ran:
             self._enforce_backbone_connectivity()
             self._refresh_leaf_parents()
         self._recompute_leaf_gradients()
@@ -1694,15 +2456,20 @@ class DsdvEnvSim:
         pdr = 100.0 * delivered / generated if generated else 0.0
         avg_latency = sum(self.latency_samples) / len(self.latency_samples) if self.latency_samples else 0.0
         avg_hops = sum(self.hop_samples) / len(self.hop_samples) if self.hop_samples else 0.0
+        hello_n = int(self.counters["hello_packets"])
+        update_n = int(self.counters["update_packets"])
         return {
+            "sim_profile": self.sim_profile,
             "nodes": self.node_count,
             "duration": self.duration,
             "dt": self.dt,
             "pdr": pdr,
             "avg_latency_s": avg_latency,
             "avg_hops": avg_hops,
-            "hello_packets": self.counters["hello_packets"],
-            "update_packets": self.counters["update_packets"],
+            "hello_packets": hello_n,
+            "update_packets": update_n,
+            "total_control_packets": hello_n + update_n,
+            "control_dropped": int(self.counters["control_dropped"]),
             "data_packets": self.counters["data_packets"],
             "data_delivered": delivered,
             "data_dropped": self.counters["data_dropped"],
@@ -1716,6 +2483,7 @@ class DsdvEnvSim:
     def summary_text(self) -> str:
         s = self.summary()
         lines = [
+            f"sim_profile: {self.sim_profile}",
             f"nodes: {s['nodes']}",
             f"duration_s: {s['duration']}",
             f"dt_s: {s['dt']}",
@@ -1724,6 +2492,8 @@ class DsdvEnvSim:
             f"avg_hops: {s['avg_hops']:.3f}",
             f"hello_packets: {s['hello_packets']}",
             f"update_packets: {s['update_packets']}",
+            f"total_control_packets: {s['total_control_packets']}",
+            f"control_dropped: {s['control_dropped']}",
             f"data_packets: {s['data_packets']}",
             f"data_delivered: {s['data_delivered']}",
             f"data_dropped: {s['data_dropped']}",
@@ -1768,8 +2538,35 @@ class DsdvEnvSim:
                 )
         return out_path
 
+    def export_per_node_stats_csv(self, out_path: Path) -> Path:
+        """Per-node TX/RX and role for forwarding-load / hotspot analysis (chapter 4.8.2)."""
+        role_names = {
+            ROLE_UNKNOWN: "unknown",
+            ROLE_BACKBONE: "backbone",
+            ROLE_LEAF: "leaf",
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = ["node_id", "role", "tx_count", "rx_count", "hello_tx_count", "dropped_count", "degree"]
+        with out_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for node in self.nodes:
+                writer.writerow(
+                    {
+                        "node_id": node.node_id,
+                        "role": role_names.get(node.role, "unknown"),
+                        "tx_count": int(node.tx_count),
+                        "rx_count": int(node.rx_count),
+                        "hello_tx_count": int(node.hello_tx_count),
+                        "dropped_count": int(node.dropped_count),
+                        "degree": int(node.degree),
+                    }
+                )
+        return out_path
+
     def _topology_frame_title(self) -> str:
-        return f"WSN topology | nodes={self.node_count}"
+        label = SIM_PROFILE_LABELS.get(self.sim_profile, self.sim_profile)
+        return f"WSN topology | nodes={self.node_count} | {label}"
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1791,6 +2588,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--path-loss-n", type=float, default=DEFAULT_PATH_LOSS_N)
     parser.add_argument("--rssi-threshold", type=float, default=DEFAULT_RSSI_THRESHOLD)
     parser.add_argument("--noise-rssi-amp", type=float, default=DEFAULT_NOISE_RSSI_AMP)
+    parser.add_argument(
+        "--placement",
+        type=str,
+        default=DEFAULT_NODE_PLACEMENT,
+        choices=("clustered", "uniform"),
+        help="Node layout: clustered (Gaussian cloud; gateway at cluster hub) or uniform (legacy).",
+    )
+    parser.add_argument(
+        "--cluster-std-frac",
+        type=float,
+        default=DEFAULT_CLUSTER_STD_FRAC,
+        help="For clustered placement, Gaussian sigma as a fraction of min(area_w, area_h). Smaller => tighter cluster.",
+    )
     parser.add_argument("--hello", type=float, default=DEFAULT_HELLO_PERIOD)
     parser.add_argument("--update", type=float, default=DEFAULT_UPDATE_PERIOD)
     parser.add_argument("--timeout", type=float, default=DEFAULT_ROUTE_TIMEOUT)
@@ -1822,12 +2632,68 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.set_defaults(backbone_forward_only=BACKBONE_FORWARD_ONLY)
 
+    parser.add_argument(
+        "--sim-profile",
+        type=str,
+        choices=("baseline", "backbone_leaf", "full"),
+        default="full",
+        help="Single-run scenario: baseline DSDV, +Backbone-Leaf only, or +Gradient (full). Ignored if --compare-three.",
+    )
+    parser.add_argument(
+        "--compare-three",
+        action="store_true",
+        help="Run all three scenarios into n<N>/baseline_dsdv, dsdv_backbone_leaf, dsdv_backbone_leaf_gradient.",
+    )
+    parser.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="Print preset evaluation scenarios S1..S12 (Vietnamese labels) and exit.",
+    )
+    scenario_cli = parser.add_mutually_exclusive_group()
+    scenario_cli.add_argument(
+        "--scenario",
+        type=str,
+        default=None,
+        choices=SCENARIO_ORDER,
+        metavar="S1",
+        help="Run a single preset scenario S1..S12; outputs go under --scenarios-dir/<id>/ (see --list-scenarios).",
+    )
+    scenario_cli.add_argument(
+        "--all-scenarios",
+        action="store_true",
+        help="Run all twelve preset scenarios S1..S12 sequentially (separate folder per id).",
+    )
+    parser.add_argument(
+        "--scenarios-dir",
+        type=Path,
+        default=None,
+        help="Root directory for --scenario / --all-scenarios outputs. Default: <out-dir>/scenarios",
+    )
+
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
-    sim = DsdvEnvSim(
+def _resolve_run_dir(args: argparse.Namespace, profile: str) -> Path:
+    scenario_id = getattr(args, "scenario_id", None)
+    if scenario_id:
+        root = Path(getattr(args, "scenarios_dir", Path(args.out_dir) / "scenarios"))
+        out_base = root / str(scenario_id)
+        name_map = dict(SIM_PROFILE_SEQUENCE)
+        if args.compare_three:
+            return out_base / name_map[profile]
+        return out_base
+
+    base = Path(args.out_dir) / f"n{args.nodes}"
+    name_map = dict(SIM_PROFILE_SEQUENCE)
+    if args.compare_three:
+        return base / name_map[profile]
+    if profile == "full":
+        return base
+    return base / name_map[profile]
+
+
+def _make_sim(args: argparse.Namespace, profile: str) -> DsdvEnvSim:
+    return DsdvEnvSim(
         nodes=args.nodes,
         duration=args.duration,
         dt=args.dt,
@@ -1845,6 +2711,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         path_loss_n=args.path_loss_n,
         rssi_threshold=args.rssi_threshold,
         noise_rssi_amp=args.noise_rssi_amp,
+        node_placement=args.placement,
+        cluster_std_frac=args.cluster_std_frac,
         hello=args.hello,
         update=args.update,
         timeout=args.timeout,
@@ -1861,15 +2729,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         video_stride=args.video_stride,
         video_max_frames=args.video_max_frames,
         backbone_forward_only=args.backbone_forward_only,
+        sim_profile=profile,
     )
 
-    run_dir = Path(args.out_dir) / f"n{args.nodes}"
+
+def _warn_if_simulation_too_short(args: argparse.Namespace, sim: DsdvEnvSim) -> None:
+    """HELLO first fires in [0.4×hello, hello]; DATA starts after ``data_start_delay``."""
+    hello_p = float(args.hello)
+    dur = float(args.duration)
+    dsd = float(args.data_start_delay)
+    if hello_p > 0 and dur < 0.4 * hello_p:
+        print(
+            f"[WARN] duration={dur}s < 0.4×hello={0.4 * hello_p:.1f}s: "
+            "thường **chưa có HELLO** → update/route/data có thể toàn 0."
+        )
+    if args.data_period > 0 and dur < dsd + float(args.data_period):
+        print(
+            f"[WARN] duration={dur}s < data_start_delay({dsd}s)+data_period: "
+            "**chưa có (hoặc rất ít) gói DATA** → PDR/độ trễ dữ liệu ≈ 0 không phản ánh chất lượng routing."
+        )
+
+
+def _export_one_run(args: argparse.Namespace, sim: DsdvEnvSim, run_dir: Path) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     sim.run(record_video=args.video, video_stride=args.video_stride, video_max_frames=args.video_max_frames)
+    _warn_if_simulation_too_short(args, sim)
     sim.export_metrics_csv(run_dir / "metrics_timeseries.csv")
     sim.export_routing_table_csv(run_dir / "routing_table_node.csv", focus_node=args.focus_node if args.focus_node >= 0 else None)
     (run_dir / "summary.txt").write_text(sim.summary_text(), encoding="utf-8")
+    sim.export_per_node_stats_csv(run_dir / "per_node_stats.csv")
+
+    chart_title = SIM_PROFILE_LABELS.get(sim.sim_profile, sim.sim_profile)
 
     if not args.no_plots:
         plot_topology_png(
@@ -1884,8 +2775,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ],
             run_dir / "topology.png",
             title=sim._topology_frame_title(),
+            sim_profile=sim.sim_profile,
         )
-        plot_metrics_chart(sim.samples, run_dir / "metrics_chart.png")
+        plot_metrics_chart(sim.samples, run_dir / "metrics_chart.png", title=chart_title)
+        plot_metrics_bar_chart(sim.samples, run_dir / "metrics_chart_bars.png")
 
     if args.video:
         suffix = ".gif" if args.video_format.lower() == "gif" else ".mp4"
@@ -1901,12 +2794,120 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     summary = sim.summary()
-    print("DSDV WSN simulation complete")
+    print(f"DSDV WSN simulation complete | {chart_title}")
     print(f"Output directory: {run_dir}")
     print(f"PDR: {summary['pdr']:.2f}%")
     print(f"Avg latency: {summary['avg_latency_s']:.6f} s")
     print(f"Avg hops: {summary['avg_hops']:.3f}")
     print(f"Route changes: {summary['route_changes']}")
+
+    scenario_id = getattr(args, "scenario_id", None)
+    if scenario_id:
+        spec: Dict[str, Any] = {
+            "scenario_id": scenario_id,
+            "description_vi": getattr(args, "scenario_description_vi", ""),
+            "sim_profile": sim.sim_profile,
+            "profile_label": SIM_PROFILE_LABELS.get(sim.sim_profile, sim.sim_profile),
+            "duration_s": float(args.duration),
+            "dt_s": float(args.dt),
+            "seed": int(args.seed),
+            "nodes": int(args.nodes),
+            "placement": str(args.placement),
+            "area_w_m": float(args.area_w),
+            "area_h_m": float(args.area_h),
+            "cluster_std_frac": float(args.cluster_std_frac),
+            "data_period_s": float(args.data_period),
+            "data_start_delay_s": float(args.data_start_delay),
+            "hello_period_s": float(args.hello),
+            "update_period_s": float(args.update),
+            "route_timeout_s": float(args.timeout),
+            "rssi_1m_dbm": float(args.rssi_1m),
+            "path_loss_n": float(args.path_loss_n),
+            "rssi_threshold_dbm": float(args.rssi_threshold),
+            "noise_rssi_amp_db": float(args.noise_rssi_amp),
+            "max_degree": int(args.max_degree),
+            "extra_edge_factor": float(args.extra_edge_factor),
+            "max_attempts": int(args.max_attempts),
+            "backbone_forward_only": bool(args.backbone_forward_only),
+            "compare_three": bool(args.compare_three),
+            "summary": summary,
+        }
+        (run_dir / "scenario_spec.json").write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    return summary
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    args = parse_args(argv)
+
+    if args.list_scenarios:
+        for sid in SCENARIO_ORDER:
+            desc = SCENARIO_PRESETS[sid].get("description_vi", "")
+            print(f"{sid}: {desc}")
+        return 0
+
+    if args.all_scenarios or args.scenario is not None:
+        if args.scenarios_dir is None:
+            args.scenarios_dir = Path(args.out_dir) / "scenarios"
+        scenario_ids = list(SCENARIO_ORDER) if args.all_scenarios else [str(args.scenario)]
+        profiles = [key for key, _ in SIM_PROFILE_SEQUENCE] if args.compare_three else [args.sim_profile]
+        all_scenario_rows: List[Dict[str, Any]] = []
+
+        for sid in scenario_ids:
+            run_args = _apply_scenario_to_args(args, sid)
+            run_args.scenarios_dir = args.scenarios_dir
+            scenario_summaries: List[Dict[str, Any]] = []
+            for profile in profiles:
+                sim = _make_sim(run_args, profile)
+                run_dir = _resolve_run_dir(run_args, profile)
+                summary = _export_one_run(run_args, sim, run_dir)
+                scenario_summaries.append(summary)
+                all_scenario_rows.append({"scenario_id": sid, "sim_profile": profile, "summary": summary})
+            if args.compare_three and not args.no_plots:
+                plot_compare_control_overhead(scenario_summaries, _resolve_run_dir(run_args, profiles[0]).parent / "control_overhead_compare.png")
+
+        root = Path(args.scenarios_dir)
+        if args.compare_three:
+            export_all_scenario_control_summary(all_scenario_rows, root / "control_overhead_12_scenarios.csv")
+            if args.all_scenarios and not args.no_plots:
+                plot_all_scenarios_control_metric(
+                    all_scenario_rows,
+                    root / "update_overhead_12_scenarios.png",
+                    metric="update_packets",
+                    title="UPDATE overhead across 12 scenarios",
+                )
+                plot_all_scenarios_control_metric(
+                    all_scenario_rows,
+                    root / "total_control_12_scenarios.png",
+                    metric="total_control_packets",
+                    title="Total control overhead across 12 scenarios",
+                )
+        if args.all_scenarios:
+            print(f"--- all-scenarios: wrote {len(scenario_ids)} runs under {root} ---")
+        else:
+            print(f"--- scenario {scenario_ids[0]}: output under {root / scenario_ids[0]} ---")
+        if args.compare_three:
+            print("--- each scenario folder contains baseline_dsdv, dsdv_backbone_leaf, dsdv_backbone_leaf_gradient ---")
+        return 0
+
+    profiles = [key for key, _ in SIM_PROFILE_SEQUENCE] if args.compare_three else [args.sim_profile]
+
+    summaries: List[Dict[str, Any]] = []
+    for profile in profiles:
+        sim = _make_sim(args, profile)
+        run_dir = _resolve_run_dir(args, profile)
+        summaries.append(_export_one_run(args, sim, run_dir))
+
+    if args.compare_three:
+        base = Path(args.out_dir) / f"n{args.nodes}"
+        if not args.no_plots:
+            plot_compare_control_overhead(summaries, base / "control_overhead_compare.png")
+        print(f"--- compare-three: outputs under {base} (baseline_dsdv, dsdv_backbone_leaf, dsdv_backbone_leaf_gradient) ---")
+
     return 0
 
 

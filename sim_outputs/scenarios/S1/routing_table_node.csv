@@ -1,0 +1,4 @@
+dest,next_hop,hop_count,seq_num,last_update
+0,0,1,0,82.000
+2,2,0,0,0.000
+5,0,2,0,79.000
